@@ -6,7 +6,6 @@ description = "Robust, blazing-fast single RPC for multiple chains with smart lo
 readme = "README.md"
 repository = "https://github.com/iamkunal9/singlerpc"
 homepage = "https://iamkunal9.github.io/singlerpc/"
-license = "MIT"
 license-file = "LICENSE"
 keywords = ["web3", "rpc", "evm"]
 authors = ["iamkunal9 <kunalsharma0553@gmail.com>"]
