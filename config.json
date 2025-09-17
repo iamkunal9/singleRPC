@@ -1,0 +1,47 @@
+{
+    "56": [
+        "https://bsc-rpc.publicnode.com",
+        "https://binance.llamarpc.com",
+        "https://bsc-dataseed1.binance.org",
+        "https://bsc-dataseed2.binance.org",
+        "https://bsc-dataseed3.binance.org",
+        "https://bsc-dataseed4.binance.org",
+        "https://bsc-dataseed1.defibit.io",
+        "https://bsc-dataseed2.defibit.io",
+        "https://bsc-dataseed3.defibit.io",
+        "https://bsc-dataseed4.defibit.io",
+        "https://bsc-dataseed1.ninicoin.io",
+        "https://bsc-dataseed2.ninicoin.io",
+        "https://bsc-dataseed3.ninicoin.io",
+        "https://bsc-dataseed4.ninicoin.io"
+    ],
+    "1": [
+        "https://ethereum-rpc.publicnode.com",
+        "https://eth.llamarpc.com",
+        "https://eth.blockrazor.xyz",
+        "https://eth-mainnet.public.blastapi.io",
+        "https://rpc.ankr.com/eth",
+        "https://eth-pokt.nodies.app",
+        "https://eth.drpc.org",
+        "https://eth.meowrpc.com",
+        "https://1rpc.io/eth",
+        "https://eth.rpc.blxrbdn.com",
+        "https://rpc.mevblocker.io/fast"
+    ],
+    "137": [
+        "https://polygon-bor-rpc.publicnode.com",
+        "https://polygon.llamarpc.com"
+    ],
+    "8453": [
+        "https://base-rpc.publicnode.com",
+        "https://base.llamarpc.com",
+        "https://base-mainnet.public.blastapi.io"
+    ],
+    "42161": [
+        "https://arbitrum-one-rpc.publicnode.com",
+        "https://arbitrum.llamarpc.com"
+    ],
+    "719": [
+        "https://rpc.shibrpc.com"
+    ]
+}
