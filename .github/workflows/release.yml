@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/create-gh-release-action@v1
+        with:
+          draft: false
+          generate_release_notes: true
+
+  upload-linux:
+    needs: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Upload binaries (Linux targets)
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: singlerpc
+          target: |
+            x86_64-unknown-linux-gnu
+            i686-unknown-linux-gnu
+            aarch64-unknown-linux-gnu
+            arm-unknown-linux-gnueabihf
+          archive: zip
+          include: README.md LICENSE
+          checksum: sha256
+          use-cross: true
+
+  upload-macos:
+    needs: create-release
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Upload binaries (macOS targets)
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: singlerpc
+          target: |
+            x86_64-apple-darwin
+            aarch64-apple-darwin
+          archive: zip
+          include: README.md LICENSE
+          checksum: sha256
+
+  upload-windows:
+    needs: create-release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Upload binaries (Windows targets)
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: singlerpc
+          target: |
+            x86_64-pc-windows-msvc
+            i686-pc-windows-msvc
+          archive: zip
+          include: README.md LICENSE
+          checksum: sha256
