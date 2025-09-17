@@ -1060,24 +1060,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rust-middleware-proxy"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "clap",
- "futures",
- "http-body-util",
- "hyper 1.7.0",
- "hyper-util",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "url",
-]
-
-[[package]]
 name = "rustc-demangle"
 version = "0.1.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1223,6 +1205,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a9e9e0b4211b72e7b8b6e85c807d36c212bdb33ea8587f7569562a84df5465b1"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "singlerpc"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "clap",
+ "futures",
+ "http-body-util",
+ "hyper 1.7.0",
+ "hyper-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "url",
 ]
 
 [[package]]

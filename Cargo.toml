@@ -1,7 +1,15 @@
 [package]
-name = "rust-middleware-proxy"
+name = "singlerpc"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+description = "Robust, blazing-fast single RPC for multiple chains with smart load balancing, health checks, continuous retries, and per-request timeouts built in."
+readme = "README.md"
+repository = "https://github.com/iamkunal9/singlerpc"
+homepage = "https://iamkunal9.github.io/singlerpc/"
+license = "MIT"
+license-file = "LICENSE"
+keywords = ["web3", "rpc", "evm"]
+authors = ["iamkunal9 <kunalsharma0553@gmail.com>"]
 
 [dependencies]
 hyper = { version = "1", features = ["full"] }
