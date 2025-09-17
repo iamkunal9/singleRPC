@@ -1,12 +1,12 @@
 name: Release
 
+permissions:
+  contents: write
+
 on:
   push:
     tags:
       - "v*.*.*"
-
-permissions:
-  contents: write
 
 jobs:
   create-release:
@@ -16,77 +16,26 @@ jobs:
       - uses: taiki-e/create-gh-release-action@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          draft: false
-          prefix: v
 
-  upload-linux:
+  upload-assets:
     needs: create-release
-    runs-on: ubuntu-latest
     strategy:
-      fail-fast: false
       matrix:
-        target: [
-          "x86_64-unknown-linux-gnu",
-          "aarch64-unknown-linux-gnu"
-        ]
+        include:
+          - os: ubuntu-latest
+            platform: linux
+          - os: macos-latest
+            platform: macos
+          - os: windows-latest
+            platform: windows
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Upload binaries (Linux targets)
-        uses: taiki-e/upload-rust-binary-action@v1
+      - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: singlerpc
-          target: ${{ matrix.target }}
-          archive: zip
-          include: README.md LICENSE
-          checksum: sha256
-          build-tool: cross
+          archive: singlerpc_$tag_${{ matrix.platform }}
+          include: LICENSE,README.md
+          tar: none
+          zip: all
           token: ${{ secrets.GITHUB_TOKEN }}
-          asset: singlerpc_{version}_{target}.zip
-
-  upload-macos:
-    needs: create-release
-    runs-on: macos-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [
-          "x86_64-apple-darwin",
-          "aarch64-apple-darwin"
-        ]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Upload binaries (macOS targets)
-        uses: taiki-e/upload-rust-binary-action@v1
-        with:
-          bin: singlerpc
-          target: ${{ matrix.target }}
-          archive: zip
-          include: README.md LICENSE
-          checksum: sha256
-          token: ${{ secrets.GITHUB_TOKEN }}
-          asset: singlerpc_{version}_{target}.zip
-
-  upload-windows:
-    needs: create-release
-    runs-on: windows-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [
-          "x86_64-pc-windows-msvc"
-        ]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Upload binaries (Windows targets)
-        uses: taiki-e/upload-rust-binary-action@v1
-        with:
-          bin: singlerpc
-          target: ${{ matrix.target }}
-          archive: zip
-          include: README.md LICENSE
-          checksum: sha256
-          token: ${{ secrets.GITHUB_TOKEN }}
-          asset: singlerpc_{version}_{target}.zip
