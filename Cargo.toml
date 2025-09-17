@@ -1,6 +1,6 @@
 [package]
 name = "singlerpc"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Robust, blazing-fast single RPC for multiple chains with smart load balancing, health checks, continuous retries, and per-request timeouts built in."
 readme = "README.md"
