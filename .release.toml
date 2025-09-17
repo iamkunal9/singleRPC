@@ -1,0 +1,10 @@
+# .release.toml
+sign-commit = true
+sign-tag = true
+push = true
+publish = true
+registry = "crates-io"
+tag-prefix = "v"
+
+[release]
+upload-doc = true
