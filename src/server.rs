@@ -1,13 +1,16 @@
-use std::net::SocketAddr;
-use std::sync::Arc;
 use hyper::service::service_fn;
-use tokio::net::TcpListener;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as HyperServerBuilder;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::net::TcpListener;
 
 use crate::proxy::RpcProxy;
 
-pub async fn run_server(proxy: Arc<RpcProxy>, addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_server(
+    proxy: Arc<RpcProxy>,
+    addr: SocketAddr,
+) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
     loop {
         let (stream, _) = listener.accept().await?;
@@ -29,5 +32,3 @@ pub async fn run_server(proxy: Arc<RpcProxy>, addr: SocketAddr) -> Result<(), Bo
         });
     }
 }
-
-
