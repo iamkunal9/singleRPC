@@ -9,6 +9,7 @@ homepage = "https://iamkunal9.github.io/singlerpc/"
 license-file = "LICENSE"
 keywords = ["web3", "rpc", "evm"]
 authors = ["iamkunal9 <kunalsharma0553@gmail.com>"]
+build = "build.rs"
 
 [dependencies]
 hyper = { version = "1", features = ["full"] }
@@ -27,3 +28,8 @@ clap = { version = "4", features = ["derive"] }
 [[bin]]
 name = "singlerpc"
 path = "src/main.rs"
+
+[build-dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ureq = { version = "2", features = ["json"] }

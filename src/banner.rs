@@ -1,6 +1,7 @@
 pub fn print_banner() {
     const VERSION: &str = env!("CARGO_PKG_VERSION");
-    println!(r#"
+    println!(
+        r#"
        .__               .__        _____________________________  
   _____|__| ____    ____ |  |   ____\______   \______   \_   ___ \ 
  /  ___/  |/    \  / ___\|  | _/ __ \|       _/|     ___/    \  \/ 
@@ -9,7 +10,6 @@ pub fn print_banner() {
       \/        \/_____/           \/       \/                  \/  v{VERSION}
 
                                                             iamkunal9.in
-"#);
+"#
+    );
 }
-
-

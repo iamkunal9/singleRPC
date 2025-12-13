@@ -12,6 +12,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+const DEFAULT_CONFIG_PATH: &str = env!("GENERATED_CONFIG_PATH");
+
 #[derive(Parser, Debug)]
 #[command(name = "singlerpc", author = "iamkunal9", version, about = None, long_about = None)]
 struct Cli {
@@ -19,7 +21,8 @@ struct Cli {
         short = 'c',
         long = "config",
         value_name = "FILE",
-        help = "Path to config.json"
+        default_value = DEFAULT_CONFIG_PATH,
+        help = "Path to config.json (defaults to the generated Chainlist snapshot)"
     )]
     config: PathBuf,
 
