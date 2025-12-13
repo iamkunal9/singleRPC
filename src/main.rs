@@ -44,6 +44,14 @@ struct Cli {
         help = "Per-RPC request timeout in seconds"
     )]
     timeout_secs: u64,
+
+    #[arg(
+        short = 'a',
+        long = "auth",
+        value_name = "TOKEN",
+        help = "Require clients to provide this token (header or ?auth=) before proxying"
+    )]
+    auth_token: Option<String>,
 }
 
 #[tokio::main]
@@ -56,6 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         chains,
         args.verbose as u8,
         std::time::Duration::from_secs(args.timeout_secs),
+        args.auth_token.clone(),
     ));
     let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
     println!("RPC Proxy Server running on port {}", args.port);

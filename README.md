@@ -39,11 +39,15 @@ singlerpc -c config.json -v
 
 # very verbose: also prints upstream response body
 singlerpc -c config.json -vv
+
+# lock the proxy behind a token (clients must send the same token)
+singlerpc -c config.json -a supersecret
 ```
 
 - -c, --config <FILE>: Path to JSON config mapping chain IDs to arrays of RPC URLs
 - -p, --port <PORT>: Port to listen on (default: 3000)
 - -t, --timeout <SECONDS>: Per-RPC request timeout (default: 5)
+- -a, --auth <TOKEN>: Require clients to include the matching token (via `Authorization: Bearer <token>`, `X-SingleRPC-Auth: <token>`, or `?auth=<token>`); omit to keep the proxy open
 - -v: Log incoming JSON, endpoint URL, and upstream status
 - -vv: Also log upstream response body
 - -h, --help: Show help

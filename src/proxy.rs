@@ -1,6 +1,8 @@
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
+use hyper::header::AUTHORIZATION;
+use hyper::http::HeaderMap;
 use hyper::{Request, Response, StatusCode};
 use reqwest::Client;
 use serde_json::{Value, json};
@@ -10,6 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::time;
+use url::form_urlencoded;
 
 #[derive(Debug, Clone)]
 pub struct RpcEndpoint {
@@ -60,6 +63,7 @@ pub struct RpcProxy {
     pub client: Client,
     verbose: u8,
     request_timeout: Duration,
+    required_auth_token: Option<String>,
 }
 
 impl RpcProxy {
@@ -67,6 +71,7 @@ impl RpcProxy {
         config: HashMap<String, Vec<String>>,
         verbose: u8,
         request_timeout: Duration,
+        required_auth_token: Option<String>,
     ) -> Self {
         let mut chains = HashMap::new();
         for (chain_id, urls) in config {
@@ -90,6 +95,7 @@ impl RpcProxy {
             client,
             verbose,
             request_timeout,
+            required_auth_token,
         }
     }
 
@@ -97,8 +103,21 @@ impl RpcProxy {
         &self,
         req: Request<Incoming>,
     ) -> Result<Response<Full<Bytes>>, Infallible> {
+        let (parts, body) = req.into_parts();
+
+        if let Some(expected) = self.required_auth_token.as_deref() {
+            if !Self::is_authorized(&parts.headers, parts.uri.query(), expected) {
+                return Ok(Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .body(Full::new(Bytes::from_static(
+                        b"Missing or invalid auth token",
+                    )))
+                    .unwrap());
+            }
+        }
+
         // Own the path string so we can still consume the request body later.
-        let path = req.uri().path().to_string();
+        let path = parts.uri.path().to_string();
         let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         if segments.is_empty() {
             return Ok(Response::builder()
@@ -109,7 +128,7 @@ impl RpcProxy {
                 .unwrap());
         }
 
-        let body_bytes = match req.into_body().collect().await {
+        let body_bytes = match body.collect().await {
             Ok(collected) => collected.to_bytes(),
             Err(_) => {
                 return Ok(Response::builder()
@@ -269,6 +288,55 @@ impl RpcProxy {
             start_idx = (start_idx + 1) % total_endpoints;
             time::sleep(Duration::from_millis(200)).await;
         }
+    }
+
+    fn is_authorized(headers: &HeaderMap, query: Option<&str>, expected: &str) -> bool {
+        Self::extract_auth_token(headers, query)
+            .map(|token| token == expected)
+            .unwrap_or(false)
+    }
+
+    fn extract_auth_token(headers: &HeaderMap, query: Option<&str>) -> Option<String> {
+        if let Some(value) = headers
+            .get("x-singlerpc-auth")
+            .and_then(|v| v.to_str().ok())
+        {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+
+        if let Some(value) = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()) {
+            let token = value
+                .strip_prefix("Bearer ")
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .or_else(|| {
+                    let trimmed = value.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                });
+            if token.is_some() {
+                return token;
+            }
+        }
+
+        if let Some(query) = query {
+            for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+                if key == "auth" {
+                    let owned = value.into_owned();
+                    if !owned.is_empty() {
+                        return Some(owned);
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     fn get_chain_state(&self, chain_id: &str) -> Option<Arc<ChainState>> {
@@ -553,4 +621,33 @@ fn code_is_empty(code: &str) -> bool {
         return stripped.chars().all(|c| c == '0');
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyper::http::header::HeaderValue;
+
+    #[test]
+    fn extracts_custom_header_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-singlerpc-auth", HeaderValue::from_static("secret"));
+        let token = RpcProxy::extract_auth_token(&headers, None);
+        assert_eq!(token.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn extracts_bearer_header_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer abc123 "));
+        let token = RpcProxy::extract_auth_token(&headers, None);
+        assert_eq!(token.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn extracts_query_token() {
+        let headers = HeaderMap::new();
+        let token = RpcProxy::extract_auth_token(&headers, Some("foo=bar&auth=qwerty"));
+        assert_eq!(token.as_deref(), Some("qwerty"));
+    }
 }
