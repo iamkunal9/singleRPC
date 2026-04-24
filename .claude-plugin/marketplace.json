@@ -1,0 +1,22 @@
+{
+  "name": "singlerpc",
+  "owner": {
+    "name": "iamkunal9",
+    "email": "kunalsharma0553@gmail.com"
+  },
+  "metadata": {
+    "description": "Skills for working with singlerpc — a local JSON-RPC proxy for many EVM chains with load balancing, failover, and a one-call cross-chain contract lookup.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "singlerpc-skill",
+      "description": "Bootstraps singlerpc when missing, runs it in the background when present, and teaches Claude Code the JSON-RPC routing pattern plus the sr_contract_chains cross-chain address lookup.",
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./skills/singlerpc"
+      ]
+    }
+  ]
+}
