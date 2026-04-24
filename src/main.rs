@@ -11,9 +11,16 @@ use clap::Parser;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 const DEFAULT_CONFIG_JSON: &str =
     include_str!(concat!(env!("OUT_DIR"), "/chains_config.json"));
+
+const INSTALL_URL: &str =
+    "https://raw.githubusercontent.com/iamkunal9/singleRPC/main/install.sh";
+
+const RELEASES_LATEST_URL: &str =
+    "https://github.com/iamkunal9/singleRPC/releases/latest";
 
 #[derive(Parser, Debug)]
 #[command(name = "singlerpc", author = "iamkunal9", version, about = None, long_about = None)]
@@ -52,6 +59,14 @@ struct Cli {
         help = "Require clients to provide this token (header or ?auth=) before proxying"
     )]
     auth_token: Option<String>,
+
+    #[arg(
+        short = 'u',
+        long = "update",
+        action = clap::ArgAction::SetTrue,
+        help = "Re-download and install the latest release via install.sh, then exit"
+    )]
+    update: bool,
 }
 
 #[tokio::main]
@@ -59,18 +74,76 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     print_banner();
     let args = Cli::parse();
 
+    if args.update {
+        return run_update().await;
+    }
+
+    if let Some(latest) = check_latest_version().await {
+        let current = env!("CARGO_PKG_VERSION");
+        if is_newer(&latest, current) {
+            eprintln!(
+                "[!] A newer singlerpc v{latest} is available (you are on v{current})."
+            );
+            eprintln!("[!] Run `singlerpc --update` to upgrade.");
+        }
+    }
+
     let chains = match args.config.as_deref() {
         Some(path) => load_config(path)?,
         None => load_config_from_str(DEFAULT_CONFIG_JSON)?,
     };
     let proxy = Arc::new(RpcProxy::with_timeout(
         chains,
-        args.verbose as u8,
-        std::time::Duration::from_secs(args.timeout_secs),
+        args.verbose,
+        Duration::from_secs(args.timeout_secs),
         args.auth_token.clone(),
     ));
     let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
     println!("RPC Proxy Server running on port {}", args.port);
     run_server(proxy, addr).await?;
     Ok(())
+}
+
+async fn run_update() -> Result<(), Box<dyn std::error::Error>> {
+    println!("[+] Updating singlerpc via {INSTALL_URL}");
+    let status = tokio::process::Command::new("bash")
+        .arg("-c")
+        .arg(format!("curl -fsSL {INSTALL_URL} | bash"))
+        .status()
+        .await?;
+    if !status.success() {
+        return Err(format!("install.sh exited with status {status}").into());
+    }
+    Ok(())
+}
+
+async fn check_latest_version() -> Option<String> {
+    let fut = async {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .ok()?;
+        let resp = client.get(RELEASES_LATEST_URL).send().await.ok()?;
+        let loc = resp
+            .headers()
+            .get(reqwest::header::LOCATION)?
+            .to_str()
+            .ok()?;
+        let tag = loc.rsplit("/tag/").next()?.trim();
+        if tag.is_empty() {
+            None
+        } else {
+            Some(tag.trim_start_matches('v').to_string())
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(3), fut)
+        .await
+        .ok()
+        .flatten()
+}
+
+fn is_newer(latest: &str, current: &str) -> bool {
+    let parse = |v: &str| -> Vec<u32> { v.split('.').filter_map(|s| s.parse().ok()).collect() };
+    parse(latest) > parse(current)
 }

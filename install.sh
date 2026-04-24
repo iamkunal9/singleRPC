@@ -84,6 +84,37 @@ $SUDO install -m 0755 "$BIN_PATH" "$INSTALL_DIR/$BIN"
 
 echo "[✓] Installed $BIN $LATEST_TAG to $INSTALL_DIR/$BIN"
 
+# Detect older $BIN binaries elsewhere on PATH so they don't shadow the new one.
+# Use a colon-separated string set (works under `set -u` on bash 3.2 too).
+STALE=""
+IFS=':' read -ra _DIRS <<< "$PATH"
+for _d in "${_DIRS[@]}"; do
+  [ -z "$_d" ] && continue
+  candidate="$_d/$BIN"
+  if [ -x "$candidate" ] && [ "$candidate" != "$INSTALL_DIR/$BIN" ]; then
+    case ":$STALE:" in
+      *":$candidate:"*) ;;  # already noted
+      *) STALE="${STALE:+$STALE:}$candidate" ;;
+    esac
+  fi
+done
+
+if [ -n "$STALE" ]; then
+  echo "[+] Removing stale $BIN binaries elsewhere on PATH:"
+  IFS=':' read -ra _STALES <<< "$STALE"
+  for s in "${_STALES[@]}"; do
+    echo "    - $s"
+    if [ -w "$s" ]; then
+      rm -f "$s"
+    elif command -v sudo >/dev/null 2>&1; then
+      sudo rm -f "$s"
+    else
+      echo "[!] Could not remove $s (no write permission, no sudo). Please remove manually." >&2
+    fi
+  done
+  hash -r 2>/dev/null || true
+fi
+
 # PATH hint if the chosen dir isn't on PATH.
 case ":$PATH:" in
   *":$INSTALL_DIR:"*) ;;

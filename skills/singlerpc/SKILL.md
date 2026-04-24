@@ -167,7 +167,14 @@ If the user wants a curated subset (or wants to add a private RPC), have them wr
 | `-t, --timeout <SEC>` | Per-RPC request timeout | `5` |
 | `-v` / `-vv`          | Verbose / very verbose logs | off |
 | `-a, --auth <TOKEN>`  | Require this token from clients | open |
+| `-u, --update`        | Re-run `install.sh` to fetch the latest release, then exit | — |
 | `-h` / `-V`           | Help / version | — |
+
+## Update behavior
+
+- On every start, singlerpc does a quick (≤2s) check against `https://github.com/iamkunal9/singleRPC/releases/latest`. If a newer tag is published than the running binary, it prints a one-line `[!] A newer singlerpc vX.Y.Z is available` warning to stderr, then continues normally — startup is not blocked even if the check fails.
+- If the user wants to upgrade, suggest `singlerpc --update`. That flag re-downloads `install.sh` from the repo, runs it (sudo prompt may appear if writing to `/usr/local/bin`), and exits. After the install completes, restart any running singlerpc process to pick up the new binary.
+- The installer also detects and removes older `singlerpc` binaries elsewhere on `$PATH` (e.g. a stale `~/.local/bin/singlerpc`) so they can't shadow the fresh install.
 
 ## Behavior notes worth knowing
 
