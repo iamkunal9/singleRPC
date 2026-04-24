@@ -22,8 +22,23 @@ Features
 
 Install
 -------
+
+One-liner (downloads the latest release for macOS or Linux and drops the `singlerpc` binary into `/usr/local/bin`, falling back to `~/.local/bin` if not writable):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/iamkunal9/singleRPC/refs/heads/main/install.sh | bash
+```
+
+Or build from source:
+
 ```bash
 cargo install --path .
+```
+
+Already installed? Upgrade in place:
+
+```bash
+singlerpc --update
 ```
 
 Usage
