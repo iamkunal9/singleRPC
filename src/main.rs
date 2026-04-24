@@ -4,7 +4,7 @@ mod proxy;
 mod server;
 
 use crate::banner::print_banner;
-use crate::config::load_config;
+use crate::config::{load_config, load_config_from_str};
 use crate::proxy::RpcProxy;
 use crate::server::run_server;
 use clap::Parser;
@@ -12,7 +12,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-const DEFAULT_CONFIG_PATH: &str = env!("GENERATED_CONFIG_PATH");
+const DEFAULT_CONFIG_JSON: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/chains_config.json"));
 
 #[derive(Parser, Debug)]
 #[command(name = "singlerpc", author = "iamkunal9", version, about = None, long_about = None)]
@@ -21,10 +22,9 @@ struct Cli {
         short = 'c',
         long = "config",
         value_name = "FILE",
-        default_value = DEFAULT_CONFIG_PATH,
-        help = "Path to config.json (defaults to the generated Chainlist snapshot)"
+        help = "Path to config.json (defaults to the embedded Chainlist snapshot)"
     )]
-    config: PathBuf,
+    config: Option<PathBuf>,
 
     #[arg(
         short = 'p',
@@ -59,7 +59,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     print_banner();
     let args = Cli::parse();
 
-    let chains = load_config(&args.config)?;
+    let chains = match args.config.as_deref() {
+        Some(path) => load_config(path)?,
+        None => load_config_from_str(DEFAULT_CONFIG_JSON)?,
+    };
     let proxy = Arc::new(RpcProxy::with_timeout(
         chains,
         args.verbose as u8,

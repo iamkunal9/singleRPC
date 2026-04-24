@@ -9,3 +9,8 @@ pub fn load_config<P: AsRef<Path>>(path: P) -> Result<ChainsConfig, Box<dyn std:
     let config: ChainsConfig = serde_json::from_reader(file)?;
     Ok(config)
 }
+
+pub fn load_config_from_str(s: &str) -> Result<ChainsConfig, Box<dyn std::error::Error>> {
+    let config: ChainsConfig = serde_json::from_str(s)?;
+    Ok(config)
+}

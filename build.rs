@@ -9,7 +9,6 @@ use std::time::Duration;
 const DEFAULT_SOURCE_URL: &str = "http://chainlist.org/rpcs.json";
 const OUTPUT_FILE_NAME: &str = "chains_config.json";
 const SOURCE_URL_ENV: &str = "CHAINLIST_RPC_URL";
-const GENERATED_PATH_ENV: &str = "GENERATED_CONFIG_PATH";
 
 #[derive(Deserialize)]
 struct ChainEntry {
@@ -59,10 +58,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let serialized = serde_json::to_string_pretty(&config)?;
     fs::write(&output_path, serialized)?;
 
-    println!(
-        "cargo:rustc-env={GENERATED_PATH_ENV}={}",
-        output_path.display()
-    );
     println!(
         "cargo:warning=Generated RPC config with {} chains from {}",
         config.len(),
