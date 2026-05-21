@@ -1,26 +1,16 @@
 mod banner;
-mod config;
-mod proxy;
-mod server;
 
 use crate::banner::print_banner;
-use crate::config::{load_config, load_config_from_str};
-use crate::proxy::RpcProxy;
-use crate::server::run_server;
 use clap::Parser;
+use singlerpc::{DEFAULT_CONFIG_JSON, RpcProxy, load_config, load_config_from_str, run_server};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-const DEFAULT_CONFIG_JSON: &str =
-    include_str!(concat!(env!("OUT_DIR"), "/chains_config.json"));
+const INSTALL_URL: &str = "https://raw.githubusercontent.com/iamkunal9/singleRPC/main/install.sh";
 
-const INSTALL_URL: &str =
-    "https://raw.githubusercontent.com/iamkunal9/singleRPC/main/install.sh";
-
-const RELEASES_LATEST_URL: &str =
-    "https://github.com/iamkunal9/singleRPC/releases/latest";
+const RELEASES_LATEST_URL: &str = "https://github.com/iamkunal9/singleRPC/releases/latest";
 
 #[derive(Parser, Debug)]
 #[command(name = "singlerpc", author = "iamkunal9", version, about = None, long_about = None)]
@@ -81,9 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(latest) = check_latest_version().await {
         let current = env!("CARGO_PKG_VERSION");
         if is_newer(&latest, current) {
-            eprintln!(
-                "[!] A newer singlerpc v{latest} is available (you are on v{current})."
-            );
+            eprintln!("[!] A newer singlerpc v{latest} is available (you are on v{current}).");
             eprintln!("[!] Run `singlerpc --update` to upgrade.");
         }
     }

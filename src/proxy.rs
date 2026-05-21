@@ -290,6 +290,140 @@ impl RpcProxy {
         }
     }
 
+    pub async fn request_json(&self, chain_id: &str, request_json: Value) -> Result<Value, String> {
+        let chain_state = self
+            .get_chain_state(chain_id)
+            .ok_or_else(|| format!("chain {} not supported", chain_id))?;
+
+        let bytes = self
+            .proxy_json_to_chain(chain_id, &chain_state, &request_json)
+            .await?;
+        serde_json::from_slice(&bytes).map_err(|err| format!("invalid JSON-RPC response: {err}"))
+    }
+
+    async fn proxy_json_to_chain(
+        &self,
+        chain_id: &str,
+        chain_state: &ChainState,
+        request_json: &Value,
+    ) -> Result<Bytes, String> {
+        let total_endpoints = chain_state.endpoints.len();
+        if total_endpoints == 0 {
+            return Err(format!("chain {chain_id} has no endpoints configured"));
+        }
+
+        let mut start_idx =
+            chain_state.current_index.fetch_add(1, Ordering::Relaxed) % total_endpoints;
+
+        loop {
+            for offset in 0..total_endpoints {
+                let idx = (start_idx + offset) % total_endpoints;
+                let endpoint = &chain_state.endpoints[idx];
+
+                if !endpoint.is_healthy() {
+                    continue;
+                }
+
+                if self.verbose >= 1 {
+                    println!(
+                        "-> Hitting endpoint: {} (timeout {:?})",
+                        endpoint.url, self.request_timeout
+                    );
+                }
+
+                match self
+                    .client
+                    .post(&endpoint.url)
+                    .json(request_json)
+                    .send()
+                    .await
+                {
+                    Ok(response) => {
+                        if self.verbose >= 1 {
+                            println!(
+                                "<- Endpoint: {} Status: {}",
+                                endpoint.url,
+                                response.status()
+                            );
+                        }
+                        if response.status().is_success() {
+                            let body = match response.bytes().await {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    if self.verbose >= 1 {
+                                        println!("read body error from {}: {}", endpoint.url, e);
+                                    }
+                                    endpoint.mark_failure();
+                                    continue;
+                                }
+                            };
+                            if self.verbose >= 2 {
+                                println!(
+                                    "<- Body from {}: {}",
+                                    endpoint.url,
+                                    String::from_utf8_lossy(&body)
+                                );
+                            }
+                            let is_json_error = serde_json::from_slice::<serde_json::Value>(&body)
+                                .ok()
+                                .and_then(|v| v.get("error").cloned())
+                                .is_some();
+                            if is_json_error || String::from_utf8_lossy(&body).contains("\"error\"")
+                            {
+                                if self.verbose >= 1 {
+                                    println!("json-rpc error from {}", endpoint.url);
+                                }
+                                endpoint.mark_failure();
+                                continue;
+                            }
+                            endpoint.reset();
+                            return Ok(body);
+                        }
+
+                        if response.status().as_u16() == 429 {
+                            if self.verbose >= 1 {
+                                println!("rate limited by {}", endpoint.url);
+                            }
+                            endpoint.mark_failure();
+                            time::sleep(Duration::from_millis(150)).await;
+                        } else if response.status().is_server_error() {
+                            if self.verbose >= 1 {
+                                println!("server error at {}", endpoint.url);
+                            }
+                            endpoint.mark_failure();
+                        } else {
+                            if self.verbose >= 1 {
+                                println!(
+                                    "unexpected status {} from {}",
+                                    response.status(),
+                                    endpoint.url
+                                );
+                            }
+                            endpoint.mark_failure();
+                        }
+                    }
+                    Err(e) => {
+                        if self.verbose >= 1 {
+                            if e.is_timeout() {
+                                println!("timeout from {}", endpoint.url);
+                            } else if e.is_connect() {
+                                println!("connect error at {}", endpoint.url);
+                            } else {
+                                println!("request error at {}: {}", endpoint.url, e);
+                            }
+                        }
+                        endpoint.mark_failure();
+                    }
+                }
+
+                time::sleep(Duration::from_millis(50)).await;
+            }
+
+            start_idx = (start_idx + 1) % total_endpoints;
+            time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
     fn is_authorized(headers: &HeaderMap, query: Option<&str>, expected: &str) -> bool {
         Self::extract_auth_token(headers, query)
             .map(|token| token == expected)

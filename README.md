@@ -19,6 +19,7 @@ Features
 - Per-request timeout (default 5s, configurable with `-t`)
 - Verbose logging levels with `-v`/`-vv`
 - CLI flags for config, port, timeout, verbosity
+- Library API for embedding the same routing/failover logic in another Rust process
 
 Install
 -------
@@ -67,6 +68,36 @@ singlerpc -c config.json -a supersecret
 - -vv: Also log upstream response body
 - -h, --help: Show help
 - -V, --version: Show version
+
+Library usage
+-------------
+
+`singlerpc` can also be embedded as a Rust library, so another daemon can reuse
+the Chainlist-backed routing and failover without running a separate HTTP
+server.
+
+```rust
+use singlerpc::{DEFAULT_CONFIG_JSON, RpcProxy, load_config_from_str};
+use serde_json::json;
+use std::time::Duration;
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let chains = load_config_from_str(DEFAULT_CONFIG_JSON)?;
+let proxy = RpcProxy::with_timeout(chains, 0, Duration::from_secs(10), None);
+
+let response = proxy.request_json("1", json!({
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "eth_chainId",
+    "params": []
+})).await?;
+
+assert_eq!(response["result"], "0x1");
+# Ok(())
+# }
+```
+
+The CLI still uses the same library internally.
 
 Config format
 -------------
