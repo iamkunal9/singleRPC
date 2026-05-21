@@ -14,8 +14,6 @@ const SOURCE_URL_ENV: &str = "CHAINLIST_RPC_URL";
 struct ChainEntry {
     #[serde(rename = "chainId")]
     chain_id: u64,
-    #[serde(rename = "isTestnet", default)]
-    is_testnet: bool,
     #[serde(default)]
     rpc: Vec<RpcEntry>,
 }
@@ -71,10 +69,6 @@ fn build_config(chains: Vec<ChainEntry>) -> BTreeMap<String, Vec<String>> {
     let mut config = BTreeMap::new();
 
     for chain in chains {
-        if chain.is_testnet {
-            continue;
-        }
-
         let mut seen = HashSet::new();
         let mut urls = Vec::new();
 

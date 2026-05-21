@@ -1,11 +1,11 @@
 ---
 name: singlerpc
-description: Use whenever the user needs a Web3 / EVM JSON-RPC endpoint (Ethereum, BSC, Polygon, Base, Arbitrum, or any mainnet chain), is being rate-limited by a public RPC, wants a unified local RPC proxy across many chains with automatic failover, or wants to discover which chains a single contract address is deployed on. Trigger on phrases like "I need an RPC", "rpc for <chain>", "rate limited by infura/alchemy", "find what chains this contract exists on", "multi-chain rpc", or any direct mention of `singlerpc` / `singleRPC`. Bootstraps the install if the binary is missing, otherwise runs it in the background and shows the user how to call it.
+description: Use whenever the user needs a Web3 / EVM JSON-RPC endpoint (Ethereum, BSC, Polygon, Base, Arbitrum, Sepolia, Base Sepolia, or any mainnet/testnet chain), is being rate-limited by a public RPC, wants a unified local RPC proxy across many chains with automatic failover, or wants to discover which chains a single contract address is deployed on. Trigger on phrases like "I need an RPC", "rpc for <chain>", "rate limited by infura/alchemy", "find what chains this contract exists on", "multi-chain rpc", or any direct mention of `singlerpc` / `singleRPC`. Bootstraps the install if the binary is missing, otherwise runs it in the background and shows the user how to call it.
 ---
 
 # singlerpc
 
-`singlerpc` is a local JSON-RPC proxy that fans requests across many public RPC endpoints per chain with round-robin load balancing, health tracking, automatic failover, and continuous retry. The user gets one stable local URL (`http://localhost:3000/<chain-id>`) instead of juggling Infura/Alchemy keys or hardcoded public RPCs. A single bundled snapshot from chainlist.org gives it coverage of every EVM mainnet out of the box.
+`singlerpc` is a local JSON-RPC proxy that fans requests across many public RPC endpoints per chain with round-robin load balancing, health tracking, automatic failover, and continuous retry. The user gets one stable local URL (`http://localhost:3000/<chain-id>`) instead of juggling Infura/Alchemy keys or hardcoded public RPCs. A single bundled snapshot from chainlist.org gives it coverage of EVM mainnets and testnets out of the box.
 
 Repository: <https://github.com/iamkunal9/singleRPC>
 
@@ -64,7 +64,7 @@ fi
 ```
 
 Notes:
-- No `-c` flag is needed — singlerpc ships with a built-in Chainlist mainnet snapshot, so every common EVM chain works immediately. Only pass `-c <file>` if the user has a custom config.
+- No `-c` flag is needed — singlerpc ships with a built-in Chainlist snapshot, so every common EVM mainnet and testnet works immediately. Only pass `-c <file>` if the user has a custom config.
 - Default port is **3000** and it binds `0.0.0.0`. Override with `-p <port>`.
 - For verbose troubleshooting use `-v` (logs endpoints & status) or `-vv` (also logs upstream bodies).
 - To require a token from clients, start with `-a <token>`; clients then send `Authorization: Bearer <token>`, `X-SingleRPC-Auth: <token>`, or `?auth=<token>`.
@@ -126,7 +126,7 @@ The response shape is:
 
 ## Supported chains
 
-By default, singlerpc loads a compile-time snapshot of **every mainnet on chainlist.org** (testnets are excluded). Common ones:
+By default, singlerpc loads a compile-time snapshot of **mainnets and testnets on chainlist.org**. Common ones:
 
 | Chain ID | Network        |
 |----------|----------------|
@@ -143,7 +143,10 @@ By default, singlerpc loads a compile-time snapshot of **every mainnet on chainl
 | 81457    | Blast          |
 | 534352   | Scroll         |
 | 7777777  | Zora           |
-| ...      | + every other Chainlist mainnet |
+| 11155111 | Sepolia        |
+| 84532    | Base Sepolia   |
+| 421614   | Arbitrum Sepolia |
+| ...      | + other Chainlist mainnets/testnets |
 
 To see exactly which chain IDs are wired up at runtime, send any chain id and check the status — `404 Chain not supported` means it's missing. The repo's sample `config.json` is just an *override example* listing 6 chains (1, 56, 137, 8453, 42161, 719); it is **not** the default. The defaults are far broader.
 
@@ -187,5 +190,4 @@ If the user wants a curated subset (or wants to add a private RPC), have them wr
 
 - Don't run `singlerpc` in the foreground in the assistant's session — it blocks. Always background it (Step 3).
 - Don't auto-install for the user. The install script writes to `/usr/local/bin` and may prompt for sudo; that's a decision for the user, not the assistant.
-- Don't assume only the 6 chains in the repo's `config.json` are supported. The default is the full Chainlist mainnet set.
-- Don't recommend `singlerpc` for testnets — the bundled snapshot filters them out.
+- Don't assume only the 6 chains in the repo's `config.json` are supported. The default is the broad Chainlist mainnet/testnet set.

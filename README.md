@@ -99,6 +99,9 @@ assert_eq!(response["result"], "0x1");
 
 The CLI still uses the same library internally.
 
+The bundled Chainlist snapshot includes both mainnets and testnets. Use a
+custom config file if you want to restrict routing to a smaller set.
+
 Config format
 -------------
 Example config.json:
