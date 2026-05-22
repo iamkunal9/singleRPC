@@ -170,6 +170,8 @@ If the user wants a curated subset (or wants to add a private RPC), have them wr
 | `-t, --timeout <SEC>` | Per-RPC request timeout | `5` |
 | `-v` / `-vv`          | Verbose / very verbose logs | off |
 | `-a, --auth <TOKEN>`  | Require this token from clients | open |
+| `--health-file <FILE>` | Persist hard-dead endpoint health | `~/.singlerpc/health.json` |
+| `--no-health-file`    | Keep endpoint health in memory only | off |
 | `-u, --update`        | Re-run `install.sh` to fetch the latest release, then exit | — |
 | `-h` / `-V`           | Help / version | — |
 
@@ -181,9 +183,10 @@ If the user wants a curated subset (or wants to add a private RPC), have them wr
 
 ## Behavior notes worth knowing
 
-- Round-robin across endpoints; an endpoint is marked unhealthy after 3 failures and deprioritized for ~3 hours, then retried.
+- Round-robin across endpoints; hard-dead endpoints are marked after 3 hard failures, persisted by the CLI, and retried after 24 hours.
+- 429 rate-limit responses use a short in-memory cooldown and are not persisted as dead.
 - The proxy keeps retrying across all endpoints until one succeeds — clients should not see 503s, but a slow chain can block until timeout × N endpoints.
-- A JSON-RPC error in the upstream body is treated as a failure and the next endpoint is tried.
+- A JSON-RPC error in the upstream body is returned to the caller immediately; it is not treated as endpoint failure.
 - Auth, when enabled, is checked before any chain routing.
 
 ## Things to avoid

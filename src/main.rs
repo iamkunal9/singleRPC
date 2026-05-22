@@ -2,7 +2,10 @@ mod banner;
 
 use crate::banner::print_banner;
 use clap::Parser;
-use singlerpc::{DEFAULT_CONFIG_JSON, RpcProxy, load_config, load_config_from_str, run_server};
+use singlerpc::{
+    DEFAULT_CONFIG_JSON, RpcProxy, default_health_store_path, load_config, load_config_from_str,
+    run_server,
+};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -51,6 +54,20 @@ struct Cli {
     auth_token: Option<String>,
 
     #[arg(
+        long = "health-file",
+        value_name = "FILE",
+        help = "Persist hard-dead endpoint health in this file (default: ~/.singlerpc/health.json)"
+    )]
+    health_file: Option<PathBuf>,
+
+    #[arg(
+        long = "no-health-file",
+        action = clap::ArgAction::SetTrue,
+        help = "Keep endpoint health in memory only"
+    )]
+    no_health_file: bool,
+
+    #[arg(
         short = 'u',
         long = "update",
         action = clap::ArgAction::SetTrue,
@@ -80,11 +97,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(path) => load_config(path)?,
         None => load_config_from_str(DEFAULT_CONFIG_JSON)?,
     };
-    let proxy = Arc::new(RpcProxy::with_timeout(
+    let health_store_path = if args.no_health_file {
+        None
+    } else {
+        args.health_file.or_else(default_health_store_path)
+    };
+    let proxy = Arc::new(RpcProxy::with_health_store(
         chains,
         args.verbose,
         Duration::from_secs(args.timeout_secs),
         args.auth_token.clone(),
+        health_store_path,
     ));
     let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
     println!("RPC Proxy Server running on port {}", args.port);

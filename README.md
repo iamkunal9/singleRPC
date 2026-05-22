@@ -64,6 +64,8 @@ singlerpc -c config.json -a supersecret
 - -p, --port <PORT>: Port to listen on (default: 3000)
 - -t, --timeout <SECONDS>: Per-RPC request timeout (default: 5)
 - -a, --auth <TOKEN>: Require clients to include the matching token (via `Authorization: Bearer <token>`, `X-SingleRPC-Auth: <token>`, or `?auth=<token>`); omit to keep the proxy open
+- --health-file <FILE>: Persist hard-dead endpoint health in this file (default: `~/.singlerpc/health.json`)
+- --no-health-file: Keep endpoint health in memory only
 - -v: Log incoming JSON, endpoint URL, and upstream status
 - -vv: Also log upstream response body
 - -h, --help: Show help
@@ -120,8 +122,9 @@ Example config.json:
 Notes
 -----
 - The proxy rotates through endpoints in a round-robin loop. If all fail in a pass, it keeps retrying (with short sleeps) until one succeeds.
-- Endpoints are marked unhealthy on repeated failures and temporarily deprioritized; they will be retried later.
-- Failures are categorized/logged (timeouts, connect errors, 429 rate-limit, 5xx server errors, JSON-RPC error objects).
+- JSON-RPC error objects from a healthy upstream are returned to the caller immediately. They are transaction or method errors, not endpoint health failures.
+- 429 rate-limit responses get a short in-memory cooldown and are retried later without being persisted as dead.
+- Hard endpoint failures such as timeouts, connect errors, body read errors, 5xx responses, or invalid upstream responses are marked dead after 3 consecutive failures. The CLI persists hard-dead endpoints for 24 hours in `~/.singlerpc/health.json` by default, then retries them.
 
 ## Contributing
 
