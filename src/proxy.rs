@@ -844,6 +844,11 @@ impl RpcProxy {
         chain_id: &str,
         block: Option<u64>,
     ) -> Vec<String> {
+        // The prober speaks EVM JSON-RPC; non-EVM keys (solana:*, tron:*) have no
+        // block-pinned state to verify, so nothing is probed or returned.
+        if !is_evm_chain_key(chain_id) {
+            return Vec::new();
+        }
         let Some(chain_state) = self.get_chain_state(chain_id) else {
             return Vec::new();
         };
@@ -1003,7 +1008,15 @@ impl RpcProxy {
             }
         };
 
-        let all_chains: Vec<String> = self.chains.lock().unwrap().keys().cloned().collect();
+        // eth_getCode only makes sense on EVM chain-id keys.
+        let all_chains: Vec<String> = self
+            .chains
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|key| is_evm_chain_key(key))
+            .cloned()
+            .collect();
         let target_chains: Vec<String> = match requested_chains {
             Some(list) if !list.is_empty() => list,
             _ => all_chains,
@@ -1212,6 +1225,10 @@ const LAGGING_PATTERNS: &[&str] = &[
     "requested block is ahead",
     "beyond head block",
     "block is not yet available",
+    // Solana: node behind the requested slot / context.
+    "minimum context slot has not been reached",
+    "block status not yet available",
+    "block not available for slot",
 ];
 
 const RATE_LIMIT_PATTERNS: &[&str] = &[
@@ -1234,6 +1251,26 @@ const TRANSIENT_PATTERNS: &[&str] = &[
     "upstream",
     "try again",
     "bad gateway",
+    // Solana getHealth-style failures (-32005 is also matched as rate limit).
+    "node is behind",
+    "node is unhealthy",
+];
+
+/// Request-specific outcomes that another node would answer the same way
+/// (EVM execution results, Solana transaction/simulation rejections). Never
+/// fail over on these, whatever else the message contains.
+const FINAL_PATTERNS: &[&str] = &[
+    "reverted",
+    "invalid opcode",
+    "transaction simulation failed",
+    "blockhash not found",
+    "insufficient funds",
+    "insufficient lamports",
+    "failed to deserialize",
+    "signature verification failure",
+    "transaction signature verification",
+    "already processed",
+    "already been processed",
 ];
 
 fn classify_rpc_error(error: &Value) -> Option<RetryKind> {
@@ -1245,11 +1282,12 @@ fn classify_rpc_error(error: &Value) -> Option<RetryKind> {
         .unwrap_or_default()
         .to_ascii_lowercase();
 
-    // Execution results are deterministic: never fail over on them.
-    if code == Some(3) || message.contains("reverted") || message.contains("invalid opcode") {
+    let matches = |patterns: &[&str]| patterns.iter().any(|p| message.contains(p));
+    // Deterministic results: never fail over. Code 3 = EVM revert; Solana -32002 =
+    // preflight simulation failure, -32003 = signature verification failure.
+    if matches!(code, Some(3) | Some(-32002) | Some(-32003)) || matches(FINAL_PATTERNS) {
         return None;
     }
-    let matches = |patterns: &[&str]| patterns.iter().any(|p| message.contains(p));
     if matches(MISSING_STATE_PATTERNS) {
         return Some(RetryKind::MissingState);
     }
@@ -1677,6 +1715,12 @@ fn parse_hex_u256ish(value: &str) -> Option<()> {
     (!hex.is_empty() && hex.len() <= 64 && hex.chars().all(|c| c.is_ascii_hexdigit())).then_some(())
 }
 
+/// EVM chains are keyed by decimal chain id; curated non-EVM keys look like
+/// `solana:mainnet` / `tron:mainnet`.
+pub fn is_evm_chain_key(key: &str) -> bool {
+    !key.is_empty() && key.bytes().all(|b| b.is_ascii_digit())
+}
+
 fn submits_transaction(request: &Value) -> bool {
     let is_send = |item: &Value| {
         matches!(
@@ -1685,6 +1729,9 @@ fn submits_transaction(request: &Value) -> bool {
                 | Some("eth_sendTransaction")
                 | Some("eth_sendRawTransactionConditional")
                 | Some("eth_sendBundle")
+                // Solana: rebroadcasting the same signed tx after an error reply
+                // only turns a real outcome into a confusing duplicate error.
+                | Some("sendTransaction")
         )
     };
     match request {
@@ -2627,6 +2674,189 @@ mod tests {
             proxy.request_json("1", balance_at("0x10")).await.unwrap();
         }
         assert!(other_hits.load(AtomicOrdering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn embedded_config_has_curated_non_evm_keys() {
+        let config = crate::load_config_from_str(crate::DEFAULT_CONFIG_JSON).unwrap();
+        for key in ["solana:mainnet", "solana:devnet", "tron:mainnet"] {
+            let urls = config.get(key).unwrap_or_else(|| panic!("{key} missing"));
+            assert!(!urls.is_empty());
+            assert!(urls.iter().all(|u| u.starts_with("https://")));
+        }
+        assert!(
+            config["solana:mainnet"].contains(&"https://api.mainnet-beta.solana.com".to_string())
+        );
+        assert!(config["solana:devnet"].contains(&"https://api.devnet.solana.com".to_string()));
+        assert!(is_evm_chain_key("1") && is_evm_chain_key("8453"));
+        assert!(!is_evm_chain_key("solana:mainnet") && !is_evm_chain_key("tron:mainnet"));
+    }
+
+    #[test]
+    fn solana_errors_are_classified() {
+        let req = json!({"jsonrpc":"2.0","id":1,"method":"sendTransaction","params":["AQ=="]});
+        let verdict = |body: &str| classify_response(&req, body.as_bytes());
+        // Returned to the client unchanged.
+        for body in [
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32002,"message":"Transaction simulation failed: Attempt to debit an account but found no record of a prior credit.","data":{"err":"AccountNotFound"}}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32002,"message":"Transaction simulation failed: Blockhash not found","data":{}}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32002,"message":"Transaction simulation failed: Error processing Instruction 0: custom program error: 0x1 (insufficient funds)"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"failed to deserialize solana_transaction::versioned::VersionedTransaction: Attempting to read 64 bytes"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32003,"message":"Transaction signature verification failure"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"Internal error: insufficient funds for fee"}}"#,
+        ] {
+            assert_eq!(verdict(body), ResponseVerdict::Usable, "{body}");
+        }
+        // Node-side problems on reads fail over.
+        let read = json!({"jsonrpc":"2.0","id":1,"method":"getAccountInfo","params":["x"]});
+        for (body, kind) in [
+            (
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"Node is behind by 152 slots","data":{"numSlotsBehind":152}}}"#,
+                RetryKind::RateLimited,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32016,"message":"Minimum context slot has not been reached","data":{"contextSlot":1}}}"#,
+                RetryKind::Transient,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"Internal error"}}"#,
+                RetryKind::Transient,
+            ),
+        ] {
+            assert_eq!(
+                classify_response(&read, body.as_bytes()),
+                ResponseVerdict::Retryable(kind),
+                "{body}"
+            );
+        }
+        // Successful simulation results (even with err inside) are plain results.
+        assert_eq!(
+            verdict(
+                r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":{"err":"BlockhashNotFound","logs":[]}}}"#
+            ),
+            ResponseVerdict::Usable
+        );
+        assert!(submits_transaction(&req));
+    }
+
+    #[tokio::test]
+    async fn solana_send_transaction_is_never_resent_on_error() {
+        for body in [
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"Internal error"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"Node is behind by 152 slots"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32002,"message":"Transaction simulation failed: Blockhash not found"}}"#,
+        ] {
+            let first_hits = Arc::new(AtomicUsize::new(0));
+            let second_hits = Arc::new(AtomicUsize::new(0));
+            let first = spawn_upstream(StatusCode::OK, body, first_hits.clone()).await;
+            let second = spawn_upstream(
+                StatusCode::OK,
+                r#"{"jsonrpc":"2.0","id":1,"result":"sig"}"#,
+                second_hits.clone(),
+            )
+            .await;
+            let proxy = RpcProxy::with_timeout(
+                HashMap::from([("solana:devnet".to_string(), vec![first, second])]),
+                0,
+                Duration::from_secs(2),
+                None,
+            );
+            let response = proxy
+                .request_json(
+                    "solana:devnet",
+                    json!({"jsonrpc":"2.0","id":1,"method":"sendTransaction","params":["AQ==",{"encoding":"base64"}]}),
+                )
+                .await
+                .unwrap();
+            let expected: Value = serde_json::from_str(body).unwrap();
+            assert_eq!(response, expected, "error must be returned unchanged");
+            assert_eq!(first_hits.load(AtomicOrdering::SeqCst), 1);
+            assert_eq!(second_hits.load(AtomicOrdering::SeqCst), 0, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn solana_reads_fail_over_on_rate_limit() {
+        let (first_hits, second_hits) =
+            (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let first = spawn_upstream(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"jsonrpc":"2.0","error":{"code":-32029,"message":"Too Many Requests"},"id":1}"#,
+            first_hits.clone(),
+        )
+        .await;
+        let second = spawn_upstream(
+            StatusCode::OK,
+            r#"{"jsonrpc":"2.0","id":1,"result":464215039}"#,
+            second_hits.clone(),
+        )
+        .await;
+        let proxy = RpcProxy::with_timeout(
+            HashMap::from([("solana:mainnet".to_string(), vec![first, second])]),
+            0,
+            Duration::from_secs(2),
+            None,
+        );
+        let response = proxy
+            .request_json(
+                "solana:mainnet",
+                json!({"jsonrpc":"2.0","id":1,"method":"getSlot"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response["result"], json!(464215039));
+        assert_eq!(second_hits.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn non_evm_keys_are_never_probed_with_evm_methods() {
+        let sol_hits = Arc::new(AtomicUsize::new(0));
+        let evm_hits = Arc::new(AtomicUsize::new(0));
+        let sol = spawn_upstream(
+            StatusCode::OK,
+            r#"{"jsonrpc":"2.0","id":1,"result":1}"#,
+            sol_hits.clone(),
+        )
+        .await;
+        let evm = spawn_upstream(
+            StatusCode::OK,
+            r#"{"jsonrpc":"2.0","id":1,"result":"0x6080"}"#,
+            evm_hits.clone(),
+        )
+        .await;
+        let proxy = RpcProxy::with_timeout(
+            HashMap::from([
+                ("solana:mainnet".to_string(), vec![sol]),
+                ("1".to_string(), vec![evm]),
+            ]),
+            0,
+            Duration::from_secs(2),
+            None,
+        );
+        assert!(
+            proxy
+                .verified_state_endpoints("solana:mainnet", None)
+                .await
+                .is_empty()
+        );
+        assert!(
+            proxy
+                .verified_state_endpoints("solana:mainnet", Some(5))
+                .await
+                .is_empty()
+        );
+        // sr_contract_chains with no explicit chain list only touches EVM keys.
+        let response = proxy
+            .handle_contract_chains(Bytes::from(
+                r#"{"jsonrpc":"2.0","id":1,"method":"sr_contract_chains","params":["0x00000000000000000000000000000000000000aa"]}"#,
+            ))
+            .await;
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert!(parsed["result"]["chains"].get("1").is_some());
+        assert!(parsed["result"]["chains"].get("solana:mainnet").is_none());
+        assert_eq!(sol_hits.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(evm_hits.load(AtomicOrdering::SeqCst), 1);
     }
 
     #[test]

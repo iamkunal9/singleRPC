@@ -1,0 +1,23 @@
+{
+  "solana:mainnet": [
+    "https://api.mainnet-beta.solana.com",
+    "https://solana-rpc.publicnode.com",
+    "https://solana.publicnode.com",
+    "https://solana.api.pocket.network",
+    "https://solana.leorpc.com/?api_key=FREE",
+    "https://solana-mainnet.gateway.tatum.io",
+    "https://solana.api.onfinality.io/public"
+  ],
+  "solana:devnet": [
+    "https://api.devnet.solana.com",
+    "https://solana-devnet.api.onfinality.io/public",
+    "https://solana-devnet.gateway.tatum.io"
+  ],
+  "tron:mainnet": [
+    "https://api.trongrid.io/jsonrpc",
+    "https://tron-evm-rpc.publicnode.com",
+    "https://tron-rpc.publicnode.com/jsonrpc",
+    "https://tron.api.pocket.network",
+    "https://tron.rpc.sentio.xyz"
+  ]
+}

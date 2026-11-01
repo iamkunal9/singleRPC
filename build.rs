@@ -9,6 +9,9 @@ use std::time::Duration;
 const DEFAULT_SOURCE_URL: &str = "http://chainlist.org/rpcs.json";
 const OUTPUT_FILE_NAME: &str = "chains_config.json";
 const SOURCE_URL_ENV: &str = "CHAINLIST_RPC_URL";
+/// Curated endpoints for non-EVM keys (Chainlist is EVM-only), keyed CAIP-2-ish:
+/// `solana:mainnet`, `solana:devnet`, `tron:mainnet`.
+const NON_EVM_FILE: &str = "non_evm_rpcs.json";
 
 #[derive(Deserialize)]
 struct ChainEntry {
@@ -42,14 +45,27 @@ impl RpcEntry {
 fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed={SOURCE_URL_ENV}");
+    println!("cargo:rerun-if-changed={NON_EVM_FILE}");
 
     let source_url = env::var(SOURCE_URL_ENV).unwrap_or_else(|_| DEFAULT_SOURCE_URL.to_string());
-    let response = ureq::get(&source_url)
-        .timeout(Duration::from_secs(30))
-        .call()?;
+    // Offline or Chainlist down: still build, with only the curated non-EVM keys.
+    let mut config = match fetch_chainlist(&source_url) {
+        Ok(chains) => build_config(chains),
+        Err(err) => {
+            println!(
+                "cargo:warning=Chainlist fetch from {source_url} failed ({err}); \
+                 embedding only the curated non-EVM chains"
+            );
+            BTreeMap::new()
+        }
+    };
 
-    let chains: Vec<ChainEntry> = response.into_json()?;
-    let config = build_config(chains);
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
+    let non_evm: BTreeMap<String, Vec<String>> =
+        serde_json::from_str(&fs::read_to_string(manifest_dir.join(NON_EVM_FILE))?)?;
+    for (key, urls) in non_evm {
+        config.insert(key, urls);
+    }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
     let output_path = out_dir.join(OUTPUT_FILE_NAME);
@@ -63,6 +79,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
 
     Ok(())
+}
+
+fn fetch_chainlist(source_url: &str) -> Result<Vec<ChainEntry>, Box<dyn Error>> {
+    let response = ureq::get(source_url)
+        .timeout(Duration::from_secs(30))
+        .call()?;
+    Ok(response.into_json()?)
 }
 
 fn build_config(chains: Vec<ChainEntry>) -> BTreeMap<String, Vec<String>> {
