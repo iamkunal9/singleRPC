@@ -16,6 +16,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// How long a capability observation (including the liar flag) is trusted.
 pub const STATE_CAPABILITY_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
+/// How long an inconclusive probe (timeout, HTTP error, rate limit, odd reply)
+/// suppresses re-probing, across processes.
+pub const PROBE_FAILURE_TTL: Duration = Duration::from_secs(60 * 60);
+
 /// What the cache knows about one endpoint for one chain.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateCapability {
@@ -33,6 +37,10 @@ pub struct StateCapability {
     pub liar: bool,
     /// Average per-call latency measured by the last probe.
     pub latency_ms: Option<u64>,
+    /// Unix seconds until which the endpoint is not re-probed after an
+    /// inconclusive probe.
+    #[serde(default)]
+    pub probe_failed_until: Option<u64>,
     /// Unix seconds after which this record is ignored.
     pub expires_at: u64,
 }
@@ -303,7 +311,48 @@ impl StateCapabilityStore {
             if latency_ms.is_some() {
                 entry.latency_ms = latency_ms;
             }
+            entry.probe_failed_until = None;
         });
+    }
+
+    /// True while an earlier inconclusive probe suppresses re-probing.
+    pub fn probe_backed_off(&self, chain_id: &str, url: &str) -> bool {
+        let now = unix_now();
+        self.get_at(chain_id, url, now)
+            .and_then(|c| c.probe_failed_until)
+            .is_some_and(|until| until > now)
+    }
+
+    /// Record an inconclusive probe. Failure-only records expire after
+    /// `PROBE_FAILURE_TTL`; existing verified/pruned/liar data keeps its own expiry.
+    pub fn record_probe_failure(&self, chain_id: &str, url: &str) {
+        self.record_probe_failure_at(chain_id, url, unix_now());
+    }
+
+    fn record_probe_failure_at(&self, chain_id: &str, url: &str, now: u64) {
+        let until = now + PROBE_FAILURE_TTL.as_secs();
+        {
+            let mut entries = self.entries.lock().unwrap();
+            let entry = entries
+                .entry(key(chain_id, url))
+                .or_insert_with(|| StateCapability {
+                    chain_id: chain_id.to_string(),
+                    url: url.to_string(),
+                    ..Default::default()
+                });
+            if entry.expires_at <= now {
+                *entry = StateCapability {
+                    chain_id: chain_id.to_string(),
+                    url: url.to_string(),
+                    ..Default::default()
+                };
+            }
+            entry.probe_failed_until = Some(until);
+            if entry.expires_at < until {
+                entry.expires_at = until;
+            }
+        }
+        self.persist();
     }
 
     /// The endpoint reported missing/pruned state at `block`.
@@ -590,6 +639,30 @@ mod tests {
             })
             .count();
         assert_eq!(leftovers, 0, "temp files left behind");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn probe_failures_use_short_ttl_and_do_not_shorten_long_records() {
+        let path = temp_path("failure.json");
+        let store = StateCapabilityStore::load(path.clone());
+        let now = unix_now();
+        store.record_probe_failure_at("1", URL, now);
+        store.record_verified("1", "https://archive", 5, Some(10), Some(1));
+        store.record_probe_failure_at("1", "https://archive", now);
+
+        let reloaded = StateCapabilityStore::load(path.clone());
+        assert!(reloaded.probe_backed_off("1", URL));
+        let failed = reloaded.get("1", URL).unwrap();
+        assert_eq!(failed.expires_at, now + PROBE_FAILURE_TTL.as_secs());
+        let archive = reloaded.get("1", "https://archive").unwrap();
+        assert!(archive.expires_at >= now + STATE_CAPABILITY_TTL.as_secs() - 5);
+        assert_eq!(archive.verified_block, Some(5));
+        let ttl = PROBE_FAILURE_TTL.as_secs();
+        assert!(reloaded.get_at("1", URL, now + ttl).is_none());
+        // A later verification clears the backoff.
+        reloaded.record_verified("1", URL, 5, Some(10), None);
+        assert!(!reloaded.probe_backed_off("1", URL));
         let _ = fs::remove_file(path);
     }
 
