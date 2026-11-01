@@ -456,6 +456,9 @@ impl RpcProxy {
 
         let deadline = Instant::now() + self.overall_deadline();
         let pinned_block = requested_block_number(request_json);
+        // A node that answered a broadcast with an error may still have
+        // propagated it; never resend on a JSON-RPC error.
+        let submits_transaction = submits_transaction(request_json);
         let mut start_idx =
             chain_state.current_index.fetch_add(1, Ordering::Relaxed) % total_endpoints;
         // Endpoints that answered this request with a retryable JSON-RPC error.
@@ -488,6 +491,10 @@ impl RpcProxy {
                     continue;
                 }
                 attempted = true;
+                if last_resort {
+                    // One final attempt per endpoint, whatever the outcome.
+                    answered_with_error[idx] = true;
+                }
 
                 if self.verbose >= 1 {
                     println!(
@@ -559,6 +566,10 @@ impl RpcProxy {
                             last_failure = format!("{}: non JSON-RPC response body", endpoint.url);
                             endpoint.mark_hard_failure(&self.health_store);
                             continue;
+                        }
+                        ResponseVerdict::Retryable(_) if submits_transaction => {
+                            endpoint.clear_failures();
+                            return Ok(body);
                         }
                         ResponseVerdict::Retryable(kind) => {
                             // The node is reachable; it just cannot serve this request.
@@ -1111,6 +1122,22 @@ fn classify_response(request: &Value, body: &[u8]) -> ResponseVerdict {
     }
 }
 
+fn submits_transaction(request: &Value) -> bool {
+    let is_send = |item: &Value| {
+        matches!(
+            item.get("method").and_then(Value::as_str),
+            Some("eth_sendRawTransaction")
+                | Some("eth_sendTransaction")
+                | Some("eth_sendRawTransactionConditional")
+                | Some("eth_sendBundle")
+        )
+    };
+    match request {
+        Value::Array(items) => items.iter().any(is_send),
+        other => is_send(other),
+    }
+}
+
 fn parse_hex_quantity(value: &str) -> Option<u64> {
     let hex = value
         .strip_prefix("0x")
@@ -1641,6 +1668,58 @@ mod tests {
         assert_eq!(first_hits.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(second_hits.load(AtomicOrdering::SeqCst), 1);
         let _ = fs::remove_file(health);
+    }
+
+    #[tokio::test]
+    async fn transaction_submission_is_not_resent_on_json_rpc_error() {
+        let (proxy, first_hits, second_hits, health) = two_upstreams(
+            StatusCode::OK,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"Internal error"}}"#,
+        )
+        .await;
+        let response = proxy
+            .request_json(
+                "1",
+                json!({"jsonrpc":"2.0","id":1,"method":"eth_sendRawTransaction","params":["0x02"]}),
+            )
+            .await
+            .unwrap();
+        assert!(response.get("error").is_some());
+        assert_eq!(first_hits.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(second_hits.load(AtomicOrdering::SeqCst), 0);
+        let _ = fs::remove_file(health);
+    }
+
+    #[tokio::test]
+    async fn last_resort_hits_throttled_endpoint_at_most_once() {
+        let first_hits = Arc::new(AtomicUsize::new(0));
+        let second_hits = Arc::new(AtomicUsize::new(0));
+        let first = spawn_upstream(
+            StatusCode::OK,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"historical state abc is not available"}}"#,
+            first_hits.clone(),
+        )
+        .await;
+        let second = spawn_upstream(
+            StatusCode::TOO_MANY_REQUESTS,
+            "slow down",
+            second_hits.clone(),
+        )
+        .await;
+        let proxy = RpcProxy::with_timeout(
+            HashMap::from([("1".to_string(), vec![first, second])]),
+            0,
+            Duration::from_secs(2),
+            None,
+        );
+        let chain = proxy.get_chain_state("1").unwrap();
+        chain.endpoints[1].mark_rate_limited();
+        let started = Instant::now();
+        let response = proxy.request_json("1", balance_at("0x100")).await.unwrap();
+        assert!(response.get("error").is_some());
+        assert_eq!(first_hits.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(second_hits.load(AtomicOrdering::SeqCst), 1);
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     #[test]
