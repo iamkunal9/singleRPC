@@ -28,6 +28,9 @@ const PROBE_CONCURRENCY: usize = 16;
 const PROBE_WALK_BACK: u64 = 4;
 /// Probed endpoints further than this behind the best head are not returned for "latest".
 const MAX_HEAD_LAG: u64 = 32;
+/// After an inconclusive probe (timeout, HTTP error, odd reply) the endpoint is
+/// not re-probed for this long. Live state: memory only.
+const PROBE_FAILURE_BACKOFF: Duration = Duration::from_secs(10 * 60);
 /// Retries on other endpoints for generic transient JSON-RPC errors
 /// (e.g. -32603 "Internal error") before returning the error to the client.
 const MAX_SOFT_RETRIES: u32 = 4;
@@ -175,6 +178,7 @@ pub struct RpcEndpoint {
     pub url: String,
     failures: Arc<Mutex<u32>>,
     unavailable_until: Arc<Mutex<Option<Instant>>>,
+    probe_backoff_until: Arc<Mutex<Option<Instant>>>,
 }
 
 impl RpcEndpoint {
@@ -188,7 +192,20 @@ impl RpcEndpoint {
             url,
             failures: Arc::new(Mutex::new(0)),
             unavailable_until: Arc::new(Mutex::new(None)),
+            probe_backoff_until: Arc::new(Mutex::new(None)),
         }
+    }
+
+    fn probe_backed_off(&self) -> bool {
+        self.probe_backoff_until
+            .lock()
+            .unwrap()
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    fn set_probe_backoff(&self, failed: bool) {
+        *self.probe_backoff_until.lock().unwrap() =
+            failed.then(|| Instant::now() + PROBE_FAILURE_BACKOFF);
     }
 
     fn clear_failures(&self) {
@@ -798,7 +815,7 @@ impl RpcProxy {
         let mut accepted: Vec<(String, u64)> = Vec::new();
         let mut to_probe: Vec<&RpcEndpoint> = Vec::new();
         for endpoint in &chain_state.endpoints {
-            if !endpoint.is_healthy() {
+            if !endpoint.is_healthy() || endpoint.probe_backed_off() {
                 continue;
             }
             match self.state_store.get(chain_id, &endpoint.url) {
@@ -825,6 +842,7 @@ impl RpcProxy {
                     Ok(outcome) => outcome,
                     Err(_) => ProbeOutcome::Failed("probe deadline exceeded".into()),
                 };
+                endpoint.set_probe_backoff(matches!(outcome, ProbeOutcome::Failed(_)));
                 (endpoint.url.clone(), outcome)
             })
             .buffer_unordered(PROBE_CONCURRENCY)
@@ -949,19 +967,48 @@ impl RpcProxy {
         let mut sample: Option<TxSample> = None;
         let mut fallback_address: Option<String> = None;
         for b in (target.saturating_sub(PROBE_WALK_BACK)..=target).rev() {
-            match call!("eth_getBlockByNumber", json!([format!("0x{b:x}"), true])) {
-                Ok(Value::Null) => return ProbeOutcome::Failed(format!("block {b} not found")),
-                Ok(blk) => {
-                    if fallback_address.is_none() {
-                        fallback_address =
-                            blk.get("miner").and_then(Value::as_str).map(str::to_string);
-                    }
-                    if let Some(found) = pick_transaction(&blk) {
-                        sample = Some(found);
-                        break;
+            let block_hex = format!("0x{b:x}");
+            let full = call!("eth_getBlockByNumber", json!([block_hex, true]));
+            // Some plans refuse full transaction objects; use hashes instead.
+            let (blk, hashes_only) = match full {
+                Ok(blk) => (blk, false),
+                Err(ProbeError::Rpc(ref err)) if classify_rpc_error(err).is_none() => {
+                    match call!("eth_getBlockByNumber", json!([block_hex, false])) {
+                        Ok(blk) => (blk, true),
+                        Err(e) => return state_error(e, "eth_getBlockByNumber"),
                     }
                 }
                 Err(e) => return state_error(e, "eth_getBlockByNumber"),
+            };
+            if blk.is_null() {
+                return ProbeOutcome::Failed(format!("block {b} not found"));
+            }
+            if fallback_address.is_none() {
+                fallback_address = blk.get("miner").and_then(Value::as_str).map(str::to_string);
+            }
+            let found = if hashes_only {
+                let mut found = None;
+                let hashes = blk
+                    .get("transactions")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                // A couple of attempts in case the last tx is a system/deposit tx.
+                for hash in hashes.iter().rev().take(2) {
+                    if let Ok(tx) = call!("eth_getTransactionByHash", json!([hash])) {
+                        found = pick_transaction(&json!({ "transactions": [tx] }));
+                        if found.is_some() {
+                            break;
+                        }
+                    }
+                }
+                found
+            } else {
+                pick_transaction(&blk)
+            };
+            if let Some(found) = found {
+                sample = Some(found);
+                break;
             }
         }
 
@@ -2245,6 +2292,31 @@ mod tests {
         );
         assert_eq!(reloaded.probe_request_count(), 0);
         let _ = fs::remove_file(state_path);
+    }
+
+    #[tokio::test]
+    async fn inconclusive_probe_is_backed_off_in_memory() {
+        let good_hits = Arc::new(AtomicUsize::new(0));
+        let bad_hits = Arc::new(AtomicUsize::new(0));
+        let good = spawn_rpc_upstream(mock_node(200, "0x6", 0), good_hits.clone()).await;
+        let bad = spawn_upstream(StatusCode::FORBIDDEN, "forbidden", bad_hits.clone()).await;
+        let proxy = RpcProxy::with_timeout(
+            HashMap::from([("1".to_string(), vec![bad, good.clone()])]),
+            0,
+            Duration::from_secs(2),
+            None,
+        );
+        assert_eq!(
+            proxy.verified_state_endpoints("1", Some(100)).await,
+            vec![good.clone()]
+        );
+        let probes = proxy.probe_request_count();
+        assert_eq!(
+            proxy.verified_state_endpoints("1", Some(100)).await,
+            vec![good]
+        );
+        assert_eq!(proxy.probe_request_count(), probes);
+        assert_eq!(bad_hits.load(AtomicOrdering::SeqCst), 1);
     }
 
     #[tokio::test]
