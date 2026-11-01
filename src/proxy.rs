@@ -1853,12 +1853,13 @@ mod tests {
         )
         .await;
         let health_path = unique_temp_path("failover-health.json");
-        let proxy = RpcProxy::with_health_store(
+        let proxy = RpcProxy::with_stores(
             HashMap::from([("1".to_string(), vec![first, second])]),
             0,
             Duration::from_secs(2),
             None,
             Some(health_path.clone()),
+            None,
         );
         (proxy, first_hits, second_hits, health_path)
     }
