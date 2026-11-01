@@ -1,4 +1,6 @@
+use crate::capability::{Coverage, StateCapabilityStore, state_store_path_for_health_file};
 use bytes::Bytes;
+use futures::stream::{self, StreamExt};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::AUTHORIZATION;
@@ -11,7 +13,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time;
@@ -20,9 +22,12 @@ use url::form_urlencoded;
 const HARD_FAILURE_THRESHOLD: u32 = 3;
 const HARD_FAILURE_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
 const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
-/// How long an endpoint that reported pruned/missing historical state is
-/// skipped for requests pinned at or below that block.
-const MISSING_STATE_TTL: Duration = Duration::from_secs(30 * 60);
+/// Parallel probes issued by `verified_state_endpoints`.
+const PROBE_CONCURRENCY: usize = 16;
+/// Blocks walked back from the target to find one with transactions.
+const PROBE_WALK_BACK: u64 = 4;
+/// Probed endpoints further than this behind the best head are not returned for "latest".
+const MAX_HEAD_LAG: u64 = 32;
 /// Retries on other endpoints for generic transient JSON-RPC errors
 /// (e.g. -32603 "Internal error") before returning the error to the client.
 const MAX_SOFT_RETRIES: u32 = 4;
@@ -170,8 +175,6 @@ pub struct RpcEndpoint {
     pub url: String,
     failures: Arc<Mutex<u32>>,
     unavailable_until: Arc<Mutex<Option<Instant>>>,
-    /// Highest block for which this endpoint reported missing (pruned) state.
-    missing_state_upto: Arc<Mutex<Option<(u64, Instant)>>>,
 }
 
 impl RpcEndpoint {
@@ -185,29 +188,7 @@ impl RpcEndpoint {
             url,
             failures: Arc::new(Mutex::new(0)),
             unavailable_until: Arc::new(Mutex::new(None)),
-            missing_state_upto: Arc::new(Mutex::new(None)),
         }
-    }
-
-    fn lacks_state_for(&self, block: u64) -> bool {
-        let mut guard = self.missing_state_upto.lock().unwrap();
-        match *guard {
-            Some((upto, expires)) if Instant::now() < expires => block <= upto,
-            Some(_) => {
-                *guard = None;
-                false
-            }
-            None => false,
-        }
-    }
-
-    fn mark_missing_state(&self, block: u64) {
-        let mut guard = self.missing_state_upto.lock().unwrap();
-        let upto = match *guard {
-            Some((existing, expires)) if Instant::now() < expires => existing.max(block),
-            _ => block,
-        };
-        *guard = Some((upto, Instant::now() + MISSING_STATE_TTL));
     }
 
     fn clear_failures(&self) {
@@ -276,6 +257,8 @@ pub struct RpcProxy {
     request_timeout: Duration,
     required_auth_token: Option<String>,
     health_store: Option<EndpointHealthStore>,
+    state_store: StateCapabilityStore,
+    probe_requests: AtomicU64,
 }
 
 impl RpcProxy {
@@ -288,6 +271,8 @@ impl RpcProxy {
         Self::with_health_store(config, verbose, request_timeout, required_auth_token, None)
     }
 
+    /// Health is persisted at `health_store_path`; state capability goes to the
+    /// sibling `<stem>.state.json` (memory only when `health_store_path` is `None`).
     pub fn with_health_store(
         config: HashMap<String, Vec<String>>,
         verbose: u8,
@@ -295,6 +280,32 @@ impl RpcProxy {
         required_auth_token: Option<String>,
         health_store_path: Option<PathBuf>,
     ) -> Self {
+        let state_store_path = health_store_path
+            .as_deref()
+            .map(state_store_path_for_health_file);
+        Self::with_stores(
+            config,
+            verbose,
+            request_timeout,
+            required_auth_token,
+            health_store_path,
+            state_store_path,
+        )
+    }
+
+    /// Full constructor. `None` paths keep that store in memory only.
+    pub fn with_stores(
+        config: HashMap<String, Vec<String>>,
+        verbose: u8,
+        request_timeout: Duration,
+        required_auth_token: Option<String>,
+        health_store_path: Option<PathBuf>,
+        state_store_path: Option<PathBuf>,
+    ) -> Self {
+        let state_store = match state_store_path {
+            Some(path) => StateCapabilityStore::load(path),
+            None => StateCapabilityStore::in_memory(),
+        };
         let health_store = health_store_path.map(EndpointHealthStore::load);
         let mut chains = HashMap::new();
         for (chain_id, urls) in config {
@@ -332,7 +343,19 @@ impl RpcProxy {
             request_timeout,
             required_auth_token,
             health_store,
+            state_store,
+            probe_requests: AtomicU64::new(0),
         }
+    }
+
+    /// The state-capability cache (for inspection).
+    pub fn state_store(&self) -> &StateCapabilityStore {
+        &self.state_store
+    }
+
+    /// Total upstream requests issued by `verified_state_endpoints` probes.
+    pub fn probe_request_count(&self) -> u64 {
+        self.probe_requests.load(Ordering::Relaxed)
     }
 
     pub async fn handle_request(
@@ -473,11 +496,10 @@ impl RpcProxy {
 
         loop {
             let mut attempted = false;
-            for offset in 0..total_endpoints {
+            for idx in self.routing_order(chain_id, chain_state, start_idx, pinned_block) {
                 if Instant::now() >= deadline {
                     break;
                 }
-                let idx = (start_idx + offset) % total_endpoints;
                 let endpoint = &chain_state.endpoints[idx];
 
                 if answered_with_error[idx]
@@ -485,9 +507,12 @@ impl RpcProxy {
                 {
                     continue;
                 }
-                if let Some(block) = pinned_block
-                    && endpoint.lacks_state_for(block)
-                {
+                // Re-checked per attempt: capability may change mid-request.
+                if matches!(
+                    self.state_store
+                        .coverage(chain_id, &endpoint.url, pinned_block),
+                    Coverage::Liar | Coverage::Pruned
+                ) {
                     continue;
                 }
                 attempted = true;
@@ -557,6 +582,7 @@ impl RpcProxy {
                     match verdict {
                         ResponseVerdict::Usable => {
                             endpoint.reset(&self.health_store);
+                            self.note_head_from(chain_id, request_json, &body);
                             return Ok(body);
                         }
                         ResponseVerdict::NotJsonRpc => {
@@ -585,7 +611,7 @@ impl RpcProxy {
                             match kind {
                                 RetryKind::MissingState => {
                                     if let Some(block) = pinned_block {
-                                        endpoint.mark_missing_state(block);
+                                        self.record_pruned(chain_id, &endpoint.url, block);
                                     }
                                 }
                                 RetryKind::RateLimited => endpoint.mark_rate_limited(),
@@ -618,7 +644,7 @@ impl RpcProxy {
                     match kind {
                         RetryKind::MissingState => {
                             if let Some(block) = pinned_block {
-                                endpoint.mark_missing_state(block);
+                                self.record_pruned(chain_id, &endpoint.url, block);
                             }
                         }
                         _ => endpoint.mark_rate_limited(),
@@ -695,6 +721,288 @@ impl RpcProxy {
                 "all upstream endpoints for chain {chain_id} failed: {last_failure}"
             )),
         }
+    }
+
+    fn record_pruned(&self, chain_id: &str, url: &str, block: u64) {
+        let head = self.state_store.head(chain_id);
+        self.state_store.record_pruned(chain_id, url, block, head);
+    }
+
+    fn note_head_from(&self, chain_id: &str, request: &Value, body: &[u8]) {
+        if request.get("method").and_then(Value::as_str) != Some("eth_blockNumber") {
+            return;
+        }
+        if let Some(head) = serde_json::from_slice::<Value>(body).ok().and_then(|v| {
+            v.get("result")
+                .and_then(Value::as_str)
+                .and_then(parse_hex_quantity)
+        }) {
+            self.state_store.note_head(chain_id, head);
+        }
+    }
+
+    /// Endpoint indices for one pass. Requests pinned to a block try endpoints
+    /// verified for that depth first (fastest first), then unknown ones;
+    /// liars and endpoints known to be pruned there are left out entirely.
+    fn routing_order(
+        &self,
+        chain_id: &str,
+        chain_state: &ChainState,
+        start_idx: usize,
+        pinned_block: Option<u64>,
+    ) -> Vec<usize> {
+        let total = chain_state.endpoints.len();
+        let rotated = (0..total).map(|offset| (start_idx + offset) % total);
+        let head = self.state_store.head(chain_id);
+        let mut covered = Vec::new();
+        let mut unknown = Vec::new();
+        for idx in rotated {
+            let url = &chain_state.endpoints[idx].url;
+            let record = self.state_store.get(chain_id, url);
+            let coverage = record
+                .as_ref()
+                .map(|r| r.coverage(pinned_block, head))
+                .unwrap_or(Coverage::Unknown);
+            match coverage {
+                Coverage::Liar | Coverage::Pruned => {}
+                Coverage::Covered if pinned_block.is_some() => {
+                    covered.push((idx, record.and_then(|r| r.latency_ms).unwrap_or(u64::MAX)))
+                }
+                _ => unknown.push(idx),
+            }
+        }
+        // Stable sort keeps the rotation among equally fast endpoints.
+        covered.sort_by_key(|(_, latency)| *latency);
+        covered
+            .into_iter()
+            .map(|(idx, _)| idx)
+            .chain(unknown)
+            .collect()
+    }
+
+    /// Endpoints that can serve state at `block` (`None` = latest), fastest first.
+    ///
+    /// Uses fresh cached capability where available and probes only unknown or
+    /// expired endpoints (in parallel, bounded). Liars, endpoints pruned at that
+    /// depth, currently dead/rate-limited endpoints, and (for latest) endpoints
+    /// lagging the best observed head are excluded.
+    pub async fn verified_state_endpoints(
+        &self,
+        chain_id: &str,
+        block: Option<u64>,
+    ) -> Vec<String> {
+        let Some(chain_state) = self.get_chain_state(chain_id) else {
+            return Vec::new();
+        };
+        let head_hint = self.state_store.head(chain_id);
+        let mut accepted: Vec<(String, u64)> = Vec::new();
+        let mut to_probe: Vec<&RpcEndpoint> = Vec::new();
+        for endpoint in &chain_state.endpoints {
+            if !endpoint.is_healthy() {
+                continue;
+            }
+            match self.state_store.get(chain_id, &endpoint.url) {
+                Some(record) => match record.coverage(block, head_hint) {
+                    Coverage::Covered => {
+                        accepted.push((endpoint.url.clone(), record.latency_ms.unwrap_or(u64::MAX)))
+                    }
+                    Coverage::Liar | Coverage::Pruned => {}
+                    Coverage::Unknown => to_probe.push(endpoint),
+                },
+                None => to_probe.push(endpoint),
+            }
+        }
+
+        let per_probe_deadline = self.request_timeout * (PROBE_WALK_BACK as u32 + 5);
+        let outcomes: Vec<(String, ProbeOutcome)> = stream::iter(to_probe)
+            .map(|endpoint| async move {
+                let outcome = match time::timeout(
+                    per_probe_deadline,
+                    self.probe_endpoint(chain_id, &endpoint.url, block),
+                )
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(_) => ProbeOutcome::Failed("probe deadline exceeded".into()),
+                };
+                (endpoint.url.clone(), outcome)
+            })
+            .buffer_unordered(PROBE_CONCURRENCY)
+            .collect()
+            .await;
+
+        let best_head = outcomes
+            .iter()
+            .filter_map(|(_, o)| match o {
+                ProbeOutcome::Verified { head, .. } => Some(*head),
+                _ => None,
+            })
+            .max();
+        for (url, outcome) in outcomes {
+            if self.verbose >= 1 {
+                println!("probe {chain_id} {url}: {outcome:?}");
+            }
+            if let ProbeOutcome::Verified { latency_ms, head } = outcome {
+                let lagging =
+                    block.is_none() && best_head.is_some_and(|best| head + MAX_HEAD_LAG < best);
+                if !lagging {
+                    accepted.push((url, latency_ms));
+                }
+            }
+        }
+        accepted.sort_by_key(|(_, latency)| *latency);
+        accepted.into_iter().map(|(url, _)| url).collect()
+    }
+
+    async fn probe_call(
+        &self,
+        url: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, ProbeError> {
+        self.probe_requests.fetch_add(1, Ordering::Relaxed);
+        let payload = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+        let response = self
+            .client
+            .post(url)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| ProbeError::Transport(e.to_string()))?;
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| ProbeError::Transport(e.to_string()))?;
+        let value: Value = serde_json::from_slice(&body)
+            .map_err(|_| ProbeError::Transport(format!("HTTP {status}: non-JSON body")))?;
+        if let Some(error) = value.get("error") {
+            return Err(ProbeError::Rpc(error.clone()));
+        }
+        if !status.is_success() {
+            return Err(ProbeError::Transport(format!("HTTP {status}")));
+        }
+        value
+            .get("result")
+            .cloned()
+            .ok_or_else(|| ProbeError::Transport("missing result".into()))
+    }
+
+    /// Verify one endpoint at `block` and record the outcome in the state store.
+    async fn probe_endpoint(&self, chain_id: &str, url: &str, block: Option<u64>) -> ProbeOutcome {
+        let outcome = self.probe_endpoint_inner(chain_id, url, block).await;
+        match &outcome {
+            ProbeOutcome::Verified { .. }
+            | ProbeOutcome::Failed(_)
+            | ProbeOutcome::Lagging { .. } => {}
+            ProbeOutcome::Pruned { block, head } => {
+                self.state_store
+                    .record_pruned(chain_id, url, *block, Some(*head))
+            }
+            ProbeOutcome::Liar => self.state_store.record_liar(chain_id, url),
+        }
+        outcome
+    }
+
+    async fn probe_endpoint_inner(
+        &self,
+        chain_id: &str,
+        url: &str,
+        block: Option<u64>,
+    ) -> ProbeOutcome {
+        let started = Instant::now();
+        let mut calls = 0u64;
+        macro_rules! call {
+            ($method:expr, $params:expr) => {{
+                calls += 1;
+                self.probe_call(url, $method, $params).await
+            }};
+        }
+
+        let head = match call!("eth_blockNumber", json!([])) {
+            Ok(v) => match v.as_str().and_then(parse_hex_quantity) {
+                Some(h) => h,
+                None => return ProbeOutcome::Failed("eth_blockNumber: invalid result".into()),
+            },
+            Err(e) => return ProbeOutcome::Failed(format!("eth_blockNumber: {e:?}")),
+        };
+        self.state_store.note_head(chain_id, head);
+        let target = match block {
+            Some(b) if b > head => return ProbeOutcome::Lagging { head },
+            Some(b) => b,
+            // A couple of blocks behind the tip so load-balanced backends agree.
+            None => head.saturating_sub(2),
+        };
+        let state_error = |e: ProbeError, what: &str| match e {
+            ProbeError::Rpc(ref err)
+                if classify_rpc_error(err) == Some(RetryKind::MissingState) =>
+            {
+                ProbeOutcome::Pruned {
+                    block: target,
+                    head,
+                }
+            }
+            other => ProbeOutcome::Failed(format!("{what}: {other:?}")),
+        };
+
+        // Find a recent-enough block with a usable transaction.
+        let mut sample: Option<TxSample> = None;
+        let mut fallback_address: Option<String> = None;
+        for b in (target.saturating_sub(PROBE_WALK_BACK)..=target).rev() {
+            match call!("eth_getBlockByNumber", json!([format!("0x{b:x}"), true])) {
+                Ok(Value::Null) => return ProbeOutcome::Failed(format!("block {b} not found")),
+                Ok(blk) => {
+                    if fallback_address.is_none() {
+                        fallback_address =
+                            blk.get("miner").and_then(Value::as_str).map(str::to_string);
+                    }
+                    if let Some(found) = pick_transaction(&blk) {
+                        sample = Some(found);
+                        break;
+                    }
+                }
+                Err(e) => return state_error(e, "eth_getBlockByNumber"),
+            }
+        }
+
+        let address = match (&sample, &fallback_address) {
+            (Some(s), _) => s.from.clone(),
+            (None, Some(miner)) => miner.clone(),
+            (None, None) => "0x0000000000000000000000000000000000000000".to_string(),
+        };
+        let target_hex = format!("0x{target:x}");
+
+        if let Some(sample) = &sample {
+            match call!("eth_getTransactionCount", json!([sample.from, target_hex])) {
+                Ok(v) => match v.as_str().and_then(parse_hex_quantity) {
+                    Some(count) if count > sample.nonce => {}
+                    Some(_) => return ProbeOutcome::Liar,
+                    None => {
+                        return ProbeOutcome::Failed("eth_getTransactionCount: invalid hex".into());
+                    }
+                },
+                Err(e) => return state_error(e, "eth_getTransactionCount"),
+            }
+        }
+        match call!("eth_getBalance", json!([address, target_hex])) {
+            Ok(v) if v.as_str().and_then(parse_hex_u256ish).is_some() => {}
+            Ok(_) => return ProbeOutcome::Failed("eth_getBalance: invalid hex".into()),
+            Err(e) => return state_error(e, "eth_getBalance"),
+        }
+        let code_address = sample
+            .as_ref()
+            .and_then(|s| s.to.clone())
+            .unwrap_or_else(|| address.clone());
+        match call!("eth_getCode", json!([code_address, target_hex])) {
+            Ok(v) if v.as_str().is_some_and(is_hex_data) => {}
+            Ok(_) => return ProbeOutcome::Failed("eth_getCode: invalid hex".into()),
+            Err(e) => return state_error(e, "eth_getCode"),
+        }
+
+        let latency_ms = (started.elapsed().as_millis() as u64) / calls.max(1);
+        self.state_store
+            .record_verified(chain_id, url, target, Some(head), Some(latency_ms));
+        ProbeOutcome::Verified { latency_ms, head }
     }
 
     fn overall_deadline(&self) -> Duration {
@@ -1120,6 +1428,72 @@ fn classify_response(request: &Value, body: &[u8]) -> ResponseVerdict {
         (Value::Array(_), _) => ResponseVerdict::NotJsonRpc,
         (_, _) => classify_single(Some(request), &response),
     }
+}
+
+#[derive(Debug)]
+#[allow(dead_code)] // payloads are surfaced through Debug in verbose logs
+enum ProbeError {
+    Transport(String),
+    Rpc(Value),
+}
+
+#[derive(Debug)]
+#[allow(dead_code)] // payloads are surfaced through Debug in verbose logs
+enum ProbeOutcome {
+    Verified {
+        latency_ms: u64,
+        head: u64,
+    },
+    Pruned {
+        block: u64,
+        head: u64,
+    },
+    Liar,
+    /// Requested block is beyond this endpoint's head (live condition, not cached).
+    Lagging {
+        head: u64,
+    },
+    /// Inconclusive (timeout, odd error); nothing is cached.
+    Failed(String),
+}
+
+struct TxSample {
+    from: String,
+    nonce: u64,
+    to: Option<String>,
+}
+
+/// Pick an ordinary transaction (legacy/2930/1559/4844/7702) with a sender and
+/// nonce. System/deposit types (OP 0x7e, Arbitrum 0x64..) are skipped.
+fn pick_transaction(block: &Value) -> Option<TxSample> {
+    let txs = block.get("transactions")?.as_array()?;
+    txs.iter().rev().find_map(|tx| {
+        let tx_type = tx
+            .get("type")
+            .and_then(Value::as_str)
+            .and_then(parse_hex_quantity)
+            .unwrap_or(0);
+        if tx_type > 4 {
+            return None;
+        }
+        Some(TxSample {
+            from: tx.get("from")?.as_str()?.to_string(),
+            nonce: parse_hex_quantity(tx.get("nonce")?.as_str()?)?,
+            to: tx.get("to").and_then(Value::as_str).map(str::to_string),
+        })
+    })
+}
+
+fn is_hex_data(value: &str) -> bool {
+    value
+        .strip_prefix("0x")
+        .is_some_and(|hex| hex.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// Validates a hex quantity of up to 256 bits (balances overflow u64).
+fn parse_hex_u256ish(value: &str) -> Option<()> {
+    let hex = value.strip_prefix("0x")?;
+    (!hex.is_empty() && hex.len() <= 64 && hex.chars().all(|c| c.is_ascii_hexdigit())).then_some(())
 }
 
 fn submits_transaction(request: &Value) -> bool {
@@ -1720,6 +2094,203 @@ mod tests {
         assert_eq!(first_hits.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(second_hits.load(AtomicOrdering::SeqCst), 1);
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    type Handler = Arc<dyn Fn(&str, &Value) -> Value + Send + Sync>;
+
+    async fn spawn_rpc_upstream(handler: Handler, hits: Arc<AtomicUsize>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let hits = hits.clone();
+                let handler = handler.clone();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let hits = hits.clone();
+                        let handler = handler.clone();
+                        async move {
+                            hits.fetch_add(1, AtomicOrdering::SeqCst);
+                            let body = req.into_body().collect().await.unwrap().to_bytes();
+                            let request: Value = serde_json::from_slice(&body).unwrap();
+                            let method = request["method"].as_str().unwrap_or_default().to_string();
+                            let mut response = handler(&method, &request["params"]);
+                            response["jsonrpc"] = json!("2.0");
+                            response["id"] = request["id"].clone();
+                            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(
+                                response.to_string(),
+                            ))))
+                        }
+                    });
+                    let _ = HyperServerBuilder::new(TokioExecutor::new())
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+        format!("http://{}", addr)
+    }
+
+    /// Mock chain: head 200; every block has one tx from 0xaa.. with nonce 5.
+    fn mock_node(head: u64, nonce_after: &'static str, pruned_below: u64) -> Handler {
+        Arc::new(move |method, params| {
+            let block_param = |i: usize| {
+                params
+                    .get(i)
+                    .and_then(Value::as_str)
+                    .and_then(parse_hex_quantity)
+            };
+            let state_block = match method {
+                "eth_getTransactionCount" | "eth_getBalance" | "eth_getCode" => block_param(1),
+                _ => None,
+            };
+            if state_block.is_some_and(|b| b < pruned_below) {
+                return json!({"error": {"code": -32000, "message": "missing trie node deadbeef"}});
+            }
+            match method {
+                "eth_blockNumber" => json!({"result": format!("0x{head:x}")}),
+                "eth_getBlockByNumber" => json!({"result": {
+                    "number": params[0],
+                    "miner": "0x00000000000000000000000000000000000000cc",
+                    "transactions": [{
+                        "type": "0x2",
+                        "from": "0x00000000000000000000000000000000000000aa",
+                        "to": "0x00000000000000000000000000000000000000bb",
+                        "nonce": "0x5"
+                    }]
+                }}),
+                "eth_getTransactionCount" => json!({"result": nonce_after}),
+                "eth_getBalance" => json!({"result": "0xde0b6b3a7640000"}),
+                "eth_getCode" => json!({"result": "0x6080"}),
+                _ => json!({"error": {"code": -32601, "message": "method not found"}}),
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn verified_state_endpoints_excludes_liars_and_pruned_and_uses_cache() {
+        let honest_hits = Arc::new(AtomicUsize::new(0));
+        let liar_hits = Arc::new(AtomicUsize::new(0));
+        let pruned_hits = Arc::new(AtomicUsize::new(0));
+        let honest = spawn_rpc_upstream(mock_node(200, "0x6", 0), honest_hits.clone()).await;
+        let liar = spawn_rpc_upstream(mock_node(200, "0x0", 0), liar_hits.clone()).await;
+        let pruned = spawn_rpc_upstream(mock_node(200, "0x6", 150), pruned_hits.clone()).await;
+        let state_path = unique_temp_path("verified.state.json");
+        let proxy = RpcProxy::with_stores(
+            HashMap::from([(
+                "1".to_string(),
+                vec![liar.clone(), pruned.clone(), honest.clone()],
+            )]),
+            0,
+            Duration::from_secs(2),
+            None,
+            None,
+            Some(state_path.clone()),
+        );
+
+        assert_eq!(
+            proxy.verified_state_endpoints("1", Some(100)).await,
+            vec![honest.clone()]
+        );
+        assert!(proxy.state_store().is_liar("1", &liar));
+        assert_eq!(
+            proxy.state_store().coverage("1", &pruned, Some(100)),
+            Coverage::Pruned
+        );
+        // Recent state on the pruned node is still fine.
+        assert_eq!(
+            proxy.verified_state_endpoints("1", Some(199)).await.len(),
+            2
+        );
+
+        let probes = proxy.probe_request_count();
+        assert_eq!(
+            proxy.verified_state_endpoints("1", Some(100)).await,
+            vec![honest.clone()]
+        );
+        assert_eq!(
+            proxy.probe_request_count(),
+            probes,
+            "second call must hit the cache"
+        );
+
+        // Routing never touches the liar, and skips the node pruned at that depth.
+        let (liar_before, pruned_before) = (
+            liar_hits.load(AtomicOrdering::SeqCst),
+            pruned_hits.load(AtomicOrdering::SeqCst),
+        );
+        for _ in 0..4 {
+            let response = proxy.request_json("1", balance_at("0x64")).await.unwrap();
+            assert!(response.get("result").is_some());
+        }
+        assert_eq!(liar_hits.load(AtomicOrdering::SeqCst), liar_before);
+        assert_eq!(pruned_hits.load(AtomicOrdering::SeqCst), pruned_before);
+
+        // Persisted: a fresh proxy on the same file needs no probes.
+        let reloaded = RpcProxy::with_stores(
+            HashMap::from([("1".to_string(), vec![liar, pruned, honest.clone()])]),
+            0,
+            Duration::from_secs(2),
+            None,
+            None,
+            Some(state_path.clone()),
+        );
+        assert_eq!(
+            reloaded.verified_state_endpoints("1", Some(100)).await,
+            vec![honest]
+        );
+        assert_eq!(reloaded.probe_request_count(), 0);
+        let _ = fs::remove_file(state_path);
+    }
+
+    #[tokio::test]
+    async fn latest_excludes_lagging_endpoints() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let fresh = spawn_rpc_upstream(mock_node(1_000, "0x6", 0), hits.clone()).await;
+        let lagging = spawn_rpc_upstream(mock_node(900, "0x6", 0), hits.clone()).await;
+        let proxy = RpcProxy::with_timeout(
+            HashMap::from([("1".to_string(), vec![lagging, fresh.clone()])]),
+            0,
+            Duration::from_secs(2),
+            None,
+        );
+        assert_eq!(proxy.verified_state_endpoints("1", None).await, vec![fresh]);
+    }
+
+    #[tokio::test]
+    async fn pinned_requests_prefer_endpoints_verified_for_that_depth() {
+        let verified_hits = Arc::new(AtomicUsize::new(0));
+        let other_hits = Arc::new(AtomicUsize::new(0));
+        let verified = spawn_rpc_upstream(mock_node(200, "0x6", 0), verified_hits.clone()).await;
+        let other = spawn_upstream(
+            StatusCode::OK,
+            r#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#,
+            other_hits.clone(),
+        )
+        .await;
+        let proxy = RpcProxy::with_timeout(
+            HashMap::from([("1".to_string(), vec![other.clone(), verified.clone()])]),
+            0,
+            Duration::from_secs(2),
+            None,
+        );
+        proxy
+            .state_store()
+            .record_verified("1", &verified, 50, Some(200), Some(10));
+        for _ in 0..4 {
+            proxy.request_json("1", balance_at("0x64")).await.unwrap();
+        }
+        assert_eq!(verified_hits.load(AtomicOrdering::SeqCst), 4);
+        assert_eq!(other_hits.load(AtomicOrdering::SeqCst), 0);
+        // Deeper than verified: no preference, round-robin as before.
+        for _ in 0..4 {
+            proxy.request_json("1", balance_at("0x10")).await.unwrap();
+        }
+        assert!(other_hits.load(AtomicOrdering::SeqCst) >= 1);
     }
 
     #[test]
