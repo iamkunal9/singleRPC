@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -118,7 +119,12 @@ pub struct StateCapabilityStore {
     entries: Arc<Mutex<HashMap<String, StateCapability>>>,
     /// Highest head seen per chain (memory only).
     heads: Arc<Mutex<HashMap<String, u64>>>,
+    /// Serializes snapshot + write + rename so concurrent updates cannot
+    /// interleave or land out of order.
+    write_lock: Arc<Mutex<()>>,
 }
+
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn key(chain_id: &str, url: &str) -> String {
     format!("{chain_id}\n{url}")
@@ -138,6 +144,7 @@ impl StateCapabilityStore {
             path: None,
             entries: Arc::new(Mutex::new(HashMap::new())),
             heads: Arc::new(Mutex::new(HashMap::new())),
+            write_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -161,6 +168,7 @@ impl StateCapabilityStore {
             path: Some(path),
             entries: Arc::new(Mutex::new(entries)),
             heads: Arc::new(Mutex::new(HashMap::new())),
+            write_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -357,6 +365,7 @@ impl StateCapabilityStore {
             );
             return;
         }
+        let _guard = self.write_lock.lock().unwrap();
         let now = unix_now();
         let file = PersistedStateFile {
             endpoints: self
@@ -376,7 +385,11 @@ impl StateCapabilityStore {
             }
         };
         // Write-then-rename so concurrent readers never see a torn file.
-        let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+        let tmp = path.with_extension(format!(
+            "tmp-{}-{}",
+            std::process::id(),
+            TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
         if let Err(err) = fs::write(&tmp, contents).and_then(|_| fs::rename(&tmp, path)) {
             eprintln!("failed to write state store {}: {}", path.display(), err);
         }
@@ -537,6 +550,47 @@ mod tests {
         store.record_pruned("1", URL, 700, Some(1_000));
         assert_eq!(store.coverage("1", URL, Some(600)), Coverage::Pruned);
         assert_eq!(store.coverage("1", URL, Some(990)), Coverage::Unknown);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_updates_all_persist() {
+        let path = temp_path("concurrent.json");
+        let store = StateCapabilityStore::load(path.clone());
+        let tasks: Vec<_> = (0..200u64)
+            .map(|i| {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    let url = format!("https://node-{i}.example");
+                    if i % 3 == 0 {
+                        store.record_liar("1", &url);
+                    } else {
+                        store.record_pruned("1", &url, i, Some(1_000));
+                    }
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let reloaded = StateCapabilityStore::load(path.clone());
+        for i in 0..200u64 {
+            let record = reloaded
+                .get("1", &format!("https://node-{i}.example"))
+                .unwrap_or_else(|| panic!("record {i} lost"));
+            assert_eq!(record.liar, i % 3 == 0);
+        }
+        let leftovers = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(&*path.file_stem().unwrap().to_string_lossy())
+                    && e.path() != path
+            })
+            .count();
+        assert_eq!(leftovers, 0, "temp files left behind");
+        let _ = fs::remove_file(path);
     }
 
     #[test]

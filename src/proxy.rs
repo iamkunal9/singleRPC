@@ -323,6 +323,27 @@ impl RpcProxy {
             Some(path) => StateCapabilityStore::load(path),
             None => StateCapabilityStore::in_memory(),
         };
+        Self::with_shared_state_store(
+            config,
+            verbose,
+            request_timeout,
+            required_auth_token,
+            health_store_path,
+            state_store,
+        )
+    }
+
+    /// Like `with_stores`, but reuses an existing (cheaply clonable) state store,
+    /// e.g. so a fork proxy built from `verified_state_endpoints` results shares
+    /// the prober's cache instead of racing it on the same file.
+    pub fn with_shared_state_store(
+        config: HashMap<String, Vec<String>>,
+        verbose: u8,
+        request_timeout: Duration,
+        required_auth_token: Option<String>,
+        health_store_path: Option<PathBuf>,
+        state_store: StateCapabilityStore,
+    ) -> Self {
         let health_store = health_store_path.map(EndpointHealthStore::load);
         let mut chains = HashMap::new();
         for (chain_id, urls) in config {

@@ -75,13 +75,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect();
             println!("  liars: {liars:?}");
             if let Some(port) = port {
-                let proxy = Arc::new(RpcProxy::with_stores(
+                // Share the prober's store: two stores on one file would race.
+                let proxy = Arc::new(RpcProxy::with_shared_state_store(
                     HashMap::from([(chain.clone(), endpoints)]),
                     1,
                     Duration::from_secs(5),
                     None,
                     None,
-                    Some(state_file.clone()),
+                    prober.state_store().clone(),
                 ));
                 println!("serving http://127.0.0.1:{port}/{chain}");
                 run_server(proxy, SocketAddr::from(([127, 0, 0, 1], port))).await?;
